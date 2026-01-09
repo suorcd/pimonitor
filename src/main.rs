@@ -966,10 +966,16 @@ async fn poll_for_new_feeds(tx: mpsc::UnboundedSender<AppUpdate>) -> Result<()> 
 }
 
 // The call to Podcast Index API /recent/newfeeds endpoint.
+// Per AGENTS.md requirement: include `since` query param = (now - 24h) as unix timestamp (seconds).
 async fn pi_get_recent_newfeeds() -> Result<Vec<Feed>> {
     let client = reqwest::Client::new();
+
+    // Compute the unix timestamp for current time minus 86,400 seconds (24 hours).
+    let since: i64 = (chrono::Utc::now() - chrono::Duration::seconds(86_400)).timestamp();
+
     let resp = client
         .get("https://api.podcastindex.org/api/1.0/recent/newfeeds")
+        .query(&[("since", since)])
         .header("User-Agent", "pimonitor/0.1")
         .send()
         .await?

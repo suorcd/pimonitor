@@ -1,15 +1,19 @@
-##: Building the pimonitor executable
+## Building the pimonitor executable
 - Run `cargo build`.  If any warnings or errors are generated, attempt to fix them and rebuild.
 
-##: Unit testing
+## Polling for new/recent feeds
+- When polling the podcast index for new/recent feeds, send the `since` url parameter which should contain a unix timestamp of the current time minus 86,400 seconds (24 hours).
+- When polling the podcast index for new/recent feeds, send the `max` url parameter with a value of 500.
+
+## Unit testing
 - When new functions are created, write a unit test for them.
 - Run `cargo test`.  If any tests fail, fix them and rebuild.
 - All tests should be created in the `tests` directory.
 
-##: AI/LLM coding
+## AI/LLM coding
 - When AI/LLM coding agents make changes, write a new datestamped file to the `.llm_history` directory outlining the changes made.
 
-##: The pimonitor.yaml configuration file
+## The `pimonitor.yaml` configuration file
 - This is a YAML configuration file.
 - If it does not exist upon startup, it will be created with blank values.
 - It should be read right before each polling interval starts.
