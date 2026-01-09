@@ -966,7 +966,8 @@ async fn poll_for_new_feeds(tx: mpsc::UnboundedSender<AppUpdate>) -> Result<()> 
 }
 
 // The call to Podcast Index API /recent/newfeeds endpoint.
-// Per AGENTS.md requirement: include `since` query param = (now - 24h) as unix timestamp (seconds).
+// Per AGENTS.md requirement: include `since` query param = (now - 24h) as unix timestamp (seconds)
+// and `max` set to 500.
 async fn pi_get_recent_newfeeds() -> Result<Vec<Feed>> {
     let client = reqwest::Client::new();
 
@@ -975,7 +976,7 @@ async fn pi_get_recent_newfeeds() -> Result<Vec<Feed>> {
 
     let resp = client
         .get("https://api.podcastindex.org/api/1.0/recent/newfeeds")
-        .query(&[("since", since)])
+        .query(&[("since", since), ("max", 500)])
         .header("User-Agent", "pimonitor/0.1")
         .send()
         .await?
