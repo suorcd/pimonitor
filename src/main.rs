@@ -1,6 +1,7 @@
 use std::io::IsTerminal as _; // for stdout().is_terminal()
 use std::time::Duration;
 use std::{fs::File, path::PathBuf};
+use std::io::{Cursor, Read};
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
@@ -15,9 +16,10 @@ use ratatui::widgets::{BarChart, Block, Borders, Clear, List, ListItem, Paragrap
 use ratatui::Terminal;
 use serde::Deserialize;
 use serde_json::Value;
-use quick_xml::events::Event as XmlEvent;
-use quick_xml::Reader as XmlReader;
-use rodio::{OutputStream, Sink, Source};
+use xml::reader::EventReader as XmlReader;
+use xml::reader::XmlEvent;
+use xml::writer::{EmitterConfig as XmlEmitterConfig, EventWriter as XmlWriter, XmlEvent as WriterXmlEvent};
+use rodio::{OutputStream, Sink};
 use rustfft::{num_complex::Complex32, FftPlanner};
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::DecoderOptions;
@@ -26,10 +28,124 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use symphonia::core::sample::Sample;
 use symphonia::default::get_probe;
 use tokio::sync::mpsc;
 use tokio::time::interval;
+use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+// Global configuration flags populated from pimonitor.yaml
+// Default polling interval is 60 seconds
+static POLL_INTERVAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(60));
+// Whether both API key and secret are present (read/write possible)
+static PI_READ_WRITE: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+
+#[derive(Debug, Deserialize)]
+struct AppConfig {
+    #[serde(default)]
+    pi_api_key: Option<String>,
+    #[serde(default)]
+    pi_api_secret: Option<String>,
+    #[serde(default)]
+    poll_interval: Option<u64>,
+}
+
+/// Evaluate a parsed `AppConfig` into concrete settings.
+/// Returns a tuple of `(poll_interval_secs, can_read_write)`.
+fn evaluate_config(cfg: &AppConfig) -> (u64, bool) {
+    // Defaults
+    let mut interval_secs: u64 = 60;
+    let key_ok = cfg
+        .pi_api_key
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let secret_ok = cfg
+        .pi_api_secret
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let can_rw = key_ok && secret_ok;
+
+    if let Some(pi) = cfg.poll_interval {
+        // Only accept if strictly greater than 30 seconds
+        if pi > 30 {
+            interval_secs = pi;
+        }
+    }
+
+    (interval_secs, can_rw)
+}
+
+fn read_yaml_config() {
+    // Read configuration from pimonitor.yaml before each polling cycle
+    let path = PathBuf::from("pimonitor.yaml");
+    let mut interval_secs: u64 = 60; // default
+    let mut can_rw = false; // default to false unless both present
+
+    if let Ok(file) = File::open(&path) {
+        match serde_yaml::from_reader::<_, AppConfig>(file) {
+            Ok(cfg) => {
+                let (ivl, rw) = evaluate_config(&cfg);
+                interval_secs = ivl;
+                can_rw = rw;
+            }
+            Err(_) => {
+                // On parse error, fall back to defaults defined above
+            }
+        }
+    } else {
+        // No file: keep defaults (60s, read/write = false)
+    }
+
+    // Persist into globals
+    POLL_INTERVAL.store(interval_secs, Ordering::Relaxed);
+    PI_READ_WRITE.store(can_rw, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_cfg(key: Option<&str>, secret: Option<&str>, poll: Option<u64>) -> AppConfig {
+        AppConfig {
+            pi_api_key: key.map(|s| s.to_string()),
+            pi_api_secret: secret.map(|s| s.to_string()),
+            poll_interval: poll,
+        }
+    }
+
+    #[test]
+    fn eval_config_both_keys_and_valid_interval() {
+        let cfg = mk_cfg(Some("abc"), Some("def"), Some(120));
+        let (secs, rw) = evaluate_config(&cfg);
+        assert_eq!(secs, 120);
+        assert!(rw);
+    }
+
+    #[test]
+    fn eval_config_missing_key_and_too_low_interval() {
+        let cfg = mk_cfg(Some("abc"), None, Some(30)); // 30 is not strictly greater than 30
+        let (secs, rw) = evaluate_config(&cfg);
+        assert_eq!(secs, 60); // default
+        assert!(!rw);
+    }
+
+    #[test]
+    fn eval_config_no_interval_defaults_to_60() {
+        let cfg = mk_cfg(None, None, None);
+        let (secs, rw) = evaluate_config(&cfg);
+        assert_eq!(secs, 60);
+        assert!(!rw);
+    }
+
+    #[test]
+    fn eval_config_min_valid_interval_31() {
+        let cfg = mk_cfg(None, None, Some(31));
+        let (secs, _rw) = evaluate_config(&cfg);
+        assert_eq!(secs, 31);
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
@@ -195,16 +311,27 @@ async fn main() -> Result<()> {
     // Spawn background task to periodically fetch
     let tx_clone = tx.clone();
     tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(60));
-        // First immediate fetch without waiting 60s
-        if let Err(e) = fetch_and_send(tx_clone.clone()).await {
+        // Initial configuration load and ticker creation
+        read_yaml_config();
+        let mut current_secs = POLL_INTERVAL.load(Ordering::Relaxed);
+        if current_secs <= 30 { current_secs = 60; }
+        let mut ticker = interval(Duration::from_secs(current_secs));
+        // First immediate fetch without waiting
+        if let Err(e) = poll_for_new_feeds(tx_clone.clone()).await {
             let mut st = AppUpdate::new();
             st.status_msg = format!("Initial fetch failed: {}", e);
             let _ = tx_clone.send(st);
         }
         loop {
+            // Read config right before each polling interval starts
+            read_yaml_config();
+            let new_secs = POLL_INTERVAL.load(Ordering::Relaxed);
+            if new_secs != current_secs {
+                current_secs = if new_secs > 30 { new_secs } else { 60 };
+                ticker = interval(Duration::from_secs(current_secs));
+            }
             ticker.tick().await;
-            if let Err(e) = fetch_and_send(tx_clone.clone()).await {
+            if let Err(e) = poll_for_new_feeds(tx_clone.clone()).await {
                 let mut st = AppUpdate::new();
                 st.status_msg = format!("Fetch failed: {}", e);
                 let _ = tx_clone.send(st);
@@ -355,7 +482,7 @@ async fn main() -> Result<()> {
                     let lang_str = feed.language.clone().unwrap_or_else(|| "n/a".into());
                     let link = feed.link.clone().unwrap_or_else(|| "<no link>".into());
                     let url = feed.url.clone().unwrap_or_default();
-                    let image = feed.image.clone().unwrap_or_default();
+                    let _image = feed.image.clone().unwrap_or_default();
                     let id_str = feed
                         .id
                         .map(|i| i.to_string())
@@ -403,15 +530,18 @@ async fn main() -> Result<()> {
                 DataSource::Api => "API",
                 DataSource::Empty => "-",
             };
+            // Status widget: commands on the top line, status message on the bottom line
             let status_text = vec![
+                // Top line: key commands and metadata
                 Line::from(vec![
                     Span::raw("q: quit  r: refresh  p: play latest  x: view XML  Esc: stop/close  ↑/↓: select  Enter: open  PgUp/PgDn/Home/End: nav  "),
                     Span::styled(
-                        format!("Updated: {}  Source: {}  ", updated, src),
+                        format!("Updated: {}  Source: {}", updated, src),
                         Style::default().fg(Color::Yellow),
                     ),
-                    Span::raw(&app.status_msg),
                 ]),
+                // Bottom line: status message only
+                Line::from(vec![Span::raw(&app.status_msg)]),
             ];
             let status = Paragraph::new(status_text)
                 .block(
@@ -480,8 +610,8 @@ async fn main() -> Result<()> {
                 f.render_widget(popup, area);
             }
 
-            // Draw EQ widget in bottom-right corner if playing/visible
-            if app.eq_visible || app.is_playing() {
+            // Draw EQ widget in bottom-right corner only while audio is playing
+            if app.is_playing() {
                 // For 12 bars with bar_width=2 and gap=1 → ~12*3=36 + borders => ~40-44
                 let eq_width: u16 = 44;
                 let eq_height: u16 = 10;
@@ -535,7 +665,7 @@ async fn main() -> Result<()> {
                             app.status_msg = String::from("Refreshing…");
                             let tx2 = tx.clone();
                             tokio::spawn(async move {
-                                let _ = fetch_and_send(tx2).await;
+                                let _ = poll_for_new_feeds(tx2).await;
                             });
                         }
                         KeyCode::Char('p') => {
@@ -544,7 +674,7 @@ async fn main() -> Result<()> {
                                     app.status_msg = "Fetching feed…".into();
                                     let ui_tx2 = ui_tx.clone();
                                     tokio::spawn(async move {
-                                        if let Err(e) = fetch_play_latest(feed_url, ui_tx2).await {
+                                        if let Err(_e) = fetch_play_latest(feed_url, ui_tx2).await {
                                             // best-effort status on error
                                         }
                                     });
@@ -559,7 +689,7 @@ async fn main() -> Result<()> {
                                     app.status_msg = "Downloading feed XML…".into();
                                     let ui_tx2 = ui_tx.clone();
                                     tokio::spawn(async move {
-                                        if let Err(e) = fetch_feed_xml(feed_url, ui_tx2).await {
+                                        if let Err(_e) = fetch_feed_xml(feed_url, ui_tx2).await {
                                             // Send error to UI channel if possible
                                         }
                                     });
@@ -767,8 +897,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn fetch_and_send(tx: mpsc::UnboundedSender<AppUpdate>) -> Result<()> {
-    let (feeds, source) = match fetch_from_api().await {
+// The main polling function which fetches new feeds from the Podcast Index API.
+async fn poll_for_new_feeds(tx: mpsc::UnboundedSender<AppUpdate>) -> Result<()> {
+    let (feeds, source) = match pi_get_recent_newfeeds().await {
         Ok(feeds) => (feeds, DataSource::Api),
         Err(e) => return Err(e),
     };
@@ -782,7 +913,8 @@ async fn fetch_and_send(tx: mpsc::UnboundedSender<AppUpdate>) -> Result<()> {
     Ok(())
 }
 
-async fn fetch_from_api() -> Result<Vec<Feed>> {
+// The call to Podcast Index API /recent/newfeeds endpoint.
+async fn pi_get_recent_newfeeds() -> Result<Vec<Feed>> {
     let client = reqwest::Client::new();
     let resp = client
         .get("https://api.podcastindex.org/api/1.0/recent/newfeeds")
@@ -813,8 +945,10 @@ async fn fetch_feed_xml(feed_url: String, tx: mpsc::UnboundedSender<UiMsg>) -> R
         Ok(resp) => match resp.error_for_status() {
             Ok(ok) => match ok.text().await {
                 Ok(text) => {
-                    // Optionally pretty-print? Keep raw as requested
-                    tx.send(UiMsg::XmlReady(text)).ok();
+                    // Pretty-print the downloaded XML for readability in the UI.
+                    // If pretty-printing fails for any reason, fall back to the raw text.
+                    let pretty = pretty_print_xml(&text).unwrap_or(text);
+                    tx.send(UiMsg::XmlReady(pretty)).ok();
                 }
                 Err(e) => {
                     tx.send(UiMsg::XmlError(format!("failed to read body: {}", e))).ok();
@@ -829,6 +963,65 @@ async fn fetch_feed_xml(feed_url: String, tx: mpsc::UnboundedSender<UiMsg>) -> R
         }
     }
     Ok(())
+}
+
+// Pretty-print XML using xml-rs event reader and writer with indentation.
+// This aims to be tolerant: in case of malformed XML, the caller should fall back to the original text.
+fn pretty_print_xml(input: &str) -> Result<String> {
+    let parser = XmlReader::from_str(input);
+
+    // Configure writer to indent with two spaces and avoid auto-inserting declarations.
+    let mut out: Vec<u8> = Vec::new();
+    let config = XmlEmitterConfig::new()
+        .perform_indent(true)
+        .indent_string("  ")
+        .write_document_declaration(false);
+    {
+        let mut writer = XmlWriter::new_with_config(&mut out, config);
+
+        for ev in parser {
+            match ev {
+                Ok(XmlEvent::StartElement { name, attributes, .. }) => {
+                    // Clone to owned strings so lifetimes outlive the builder until write.
+                    let elem_name = name.local_name.clone();
+                    let attrs_owned: Vec<(String, String)> = attributes
+                        .into_iter()
+                        .map(|a| (a.name.local_name, a.value))
+                        .collect();
+
+                    // Build a start element with attributes
+                    let mut elem = WriterXmlEvent::start_element(elem_name.as_str());
+                    for (k, v) in &attrs_owned {
+                        elem = elem.attr(k.as_str(), v.as_str());
+                    }
+                    writer.write(elem)?;
+                }
+                Ok(XmlEvent::EndElement { .. }) => {
+                    writer.write(WriterXmlEvent::end_element())?;
+                }
+                Ok(XmlEvent::Characters(text)) => {
+                    writer.write(WriterXmlEvent::characters(&text))?;
+                }
+                Ok(XmlEvent::CData(text)) => {
+                    writer.write(WriterXmlEvent::cdata(&text))?;
+                }
+                Ok(XmlEvent::Comment(text)) => {
+                    writer.write(WriterXmlEvent::comment(&text))?;
+                }
+                Ok(XmlEvent::ProcessingInstruction { name, data }) => {
+                    writer.write(WriterXmlEvent::processing_instruction(&name, data.as_deref()))?;
+                }
+                // Ignore other events such as StartDocument/EndDocument/Whitespace to avoid duplicating declarations
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(anyhow::anyhow!("XML parse error: {}", e));
+                }
+            }
+        }
+    }
+
+    let s = String::from_utf8(out)?;
+    Ok(s)
 }
 
 // Lightweight update passed from background fetch to UI thread
@@ -875,32 +1068,24 @@ async fn fetch_play_latest(feed_url: String, tx: mpsc::UnboundedSender<UiMsg>) -
 }
 
 fn extract_latest_enclosure_url(xml: &str) -> Option<String> {
-    let mut reader = XmlReader::from_str(xml);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
+    let parser = XmlReader::from_str(xml);
     let mut in_item = false;
     let mut saw_any_item = false;
     // Track whether we saw an <enclosure> at all in the first <item>
     let mut saw_enclosure_tag = false;
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(XmlEvent::Start(e)) => {
-                if e.name().as_ref() == b"item" {
+
+    for event in parser {
+        match event {
+            Ok(XmlEvent::StartElement { name, attributes, .. }) => {
+                if name.local_name == "item" {
                     in_item = true;
                     saw_any_item = true;
-                } else if in_item && e.name().as_ref() == b"enclosure" {
+                } else if in_item && name.local_name == "enclosure" {
                     saw_enclosure_tag = true;
                     // Look for url attribute
-                    for attr in e.attributes().flatten() {
-                        let key = attr.key.as_ref();
-                        if key == b"url" {
-                            if let Ok(val) = attr.unescape_value() {
-                                return Some(val.to_string());
-                            } else {
-                                eprintln!(
-                                    "extract_latest_enclosure_url: found <enclosure> but failed to unescape 'url' attribute value"
-                                );
-                            }
+                    for attr in attributes {
+                        if attr.name.local_name == "url" {
+                            return Some(attr.value);
                         }
                     }
                     // If we reached here, enclosure had no 'url' attribute
@@ -909,8 +1094,8 @@ fn extract_latest_enclosure_url(xml: &str) -> Option<String> {
                     );
                 }
             }
-            Ok(XmlEvent::End(e)) => {
-                if e.name().as_ref() == b"item" {
+            Ok(XmlEvent::EndElement { name }) => {
+                if name.local_name == "item" {
                     // Finished first item without returning. Provide details.
                     if !saw_enclosure_tag {
                         eprintln!(
@@ -924,7 +1109,7 @@ fn extract_latest_enclosure_url(xml: &str) -> Option<String> {
                     return None;
                 }
             }
-            Ok(XmlEvent::Eof) => {
+            Ok(XmlEvent::EndDocument) => {
                 if !saw_any_item {
                     eprintln!(
                         "extract_latest_enclosure_url: no <item> element found in RSS/Atom feed"
@@ -949,7 +1134,6 @@ fn extract_latest_enclosure_url(xml: &str) -> Option<String> {
             }
             _ => {}
         }
-        buf.clear();
     }
     None
 }
@@ -970,8 +1154,15 @@ fn start_playback_from_file(path: &PathBuf) -> Result<(OutputStream, Sink)> {
     // Keep OutputStream alive together with Sink
     let (stream, handle) = OutputStream::try_default()?;
     let sink = Sink::try_new(&handle)?;
-    let file = File::open(path)?;
-    let decoder = rodio::Decoder::new(std::io::BufReader::new(file))?;
+
+    // Work around rodio/symphonia init panic on some platforms due to unexpected seek errors
+    // by providing a fully in-memory, seekable source (Cursor<Vec<u8>>).
+    let mut file = File::open(path)?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    let cursor = Cursor::new(buf);
+
+    let decoder = rodio::Decoder::new(cursor)?;
     sink.append(decoder);
     sink.play();
     Ok((stream, sink))
@@ -1087,7 +1278,7 @@ fn analyze_file_eq(path: PathBuf, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()
                 for f in 0..buf.frames() {
                     let mut s = 0.0f32;
                     for ch in 0..chs {
-                        let v = buf.chan(ch)[f].into_i32() as f32 / 8_388_608.0; // 2^23
+                        let v = buf.chan(ch)[f].inner() as f32 / 8_388_608.0; // 2^23
                         s += v;
                     }
                     s /= chs as f32;
