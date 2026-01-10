@@ -15,12 +15,13 @@
 - If the call to the '/report/problematic' endpoint fails, print an error message to the console.
 - If the call to the '/report/problematic' endpoint succeeds, refresh the feed list by polling the new/recent feeds endpoint again.
 - Upon pressing the `d` key, pop open a small dialog box asking the user to select a reason for marking the feed as problematic.  The user should be able to select one of the following reasons:
-  - `Dead` translates to `reason` value of `0`
+  - `No Reason` translates to `reason` value of `0`
   - `Spam` translates to `reason` value of `1`
-  - `Slop` translates to `reason` value of `2`
-  - `Illegal` translates to `reason` value of `3`
+  - `AI Slop` translates to `reason` value of `2`
+  - `Illegal Content` translates to `reason` value of `3`
   - `Duplicate` translates to `reason` value of `4`
-  - `Malicious` translates to `reason` value of `5`
+  - `Malicious Payload` translates to `reason` value of `5`
+  - `Feed Hijack` translates to `reason` value of `6`
 - The `reason` value selected by the user should be sent as a url parameter called `reason` in the call to the '/report/problematic' endpoint.
 
 ## Unit testing
@@ -30,6 +31,7 @@
 
 ## AI/LLM coding
 - When AI/LLM coding agents make changes, write a new datestamped file to the `.llm_history` directory outlining the changes made.
+- The generated file should be added to the current commit.
 
 ## The `pimonitor.yaml` configuration file
 - This is a YAML configuration file.
