@@ -5,10 +5,10 @@ allows rudimentary analysis of them.  This is a work in progress.
 
 ## Key bindings
 - `q` to quit
-- `d` to mark a feed as dead
 - `r` to refresh the feed list
-- `x` to view the RSS xml for the selected feed
 - `p` to play the latest enclosure for the selected feed
+- `x` to view the RSS xml for the selected feed
+- `d` to mark a feed as problematic
 - `esc` to exit a dialog or stop playback
 
 ## Planned features
@@ -41,8 +41,6 @@ You can just clone this repo and run the tool with:
 git clone https://github.com/Podcastindex-org/pimonitor.git && cd "$(basename "$_" .git)"
 cargo run
 ```
-
-
 
 ## Screenshot
 <img width="1681" height="1325" alt="imagen" src="https://github.com/user-attachments/assets/3c69ba44-c208-473e-b0be-67804628f351" />
