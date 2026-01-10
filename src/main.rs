@@ -264,6 +264,7 @@ struct AppState {
     audio_stream: Option<OutputStream>,
     audio_sink: Option<Sink>,
     temp_audio_path: Option<PathBuf>,
+    playing_feed_id: Option<u64>,
     // EQ UI state
     eq_levels: [f32; 12],
     eq_visible: bool,
@@ -294,6 +295,7 @@ impl AppState {
             audio_stream: None,
             audio_sink: None,
             temp_audio_path: None,
+            playing_feed_id: None,
             eq_levels: [0.0; 12],
             eq_visible: false,
             reason_modal: false,
@@ -322,6 +324,7 @@ impl AppState {
         if let Some(p) = self.temp_audio_path.take() {
             let _ = std::fs::remove_file(p);
         }
+        self.playing_feed_id = None;
         self.eq_visible = false;
         self.status_msg = "Playback stopped".into();
     }
@@ -885,19 +888,30 @@ async fn main() -> Result<()> {
                         }
                         // Vim mode space for play/pause toggle
                         KeyCode::Char(' ') if app.vim_mode => {
-                            // Check if audio is currently playing or paused
-                            if let Some(sink) = &app.audio_sink {
-                                if sink.is_paused() {
-                                    sink.play();
-                                    app.status_msg = "Playback resumed".into();
+                            if let Some(feed) = app.feeds.get(app.selected) {
+                                let selected_feed_id = feed.id;
+                                // Check if we're playing the currently selected feed
+                                let is_same_feed = app.playing_feed_id == selected_feed_id;
+                                
+                                if is_same_feed && app.audio_sink.is_some() {
+                                    // Same feed - toggle pause/resume
+                                    if let Some(sink) = &app.audio_sink {
+                                        if sink.is_paused() {
+                                            sink.play();
+                                            app.status_msg = "Playback resumed".into();
+                                        } else {
+                                            sink.pause();
+                                            app.status_msg = "Playback paused".into();
+                                        }
+                                    }
                                 } else {
-                                    sink.pause();
-                                    app.status_msg = "Playback paused".into();
-                                }
-                            } else {
-                                // No audio loaded, start playing the selected feed
-                                if let Some(feed) = app.feeds.get(app.selected) {
+                                    // Different feed or no audio loaded - start playing the selected feed
                                     if let Some(feed_url) = feed.url.clone() {
+                                        // Stop current playback if any
+                                        if app.audio_sink.is_some() {
+                                            app.stop_playback();
+                                        }
+                                        app.playing_feed_id = selected_feed_id;
                                         app.status_msg = "Fetching feed…".into();
                                         let ui_tx2 = ui_tx.clone();
                                         tokio::spawn(async move {
