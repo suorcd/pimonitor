@@ -1,7 +1,7 @@
 # Vim Keybindings Implementation
 
 **Date:** 2026-01-09
-**Last Updated:** 2026-01-09
+**Last Updated:** 2026-01-09 (multiple sessions)
 
 ## Summary
 Added vim-style keyboard navigation to the pimonitor TUI application, enabled via a `--vim` command line flag. Includes help modal, simplified status bar, and intelligent play/pause functionality.
@@ -19,6 +19,7 @@ Added vim-style keyboard navigation to the pimonitor TUI application, enabled vi
 - Added `playing_feed_id: Option<u64>` field to track which feed is currently playing
 - Added `playing_feed_title: Option<String>` field to display currently playing podcast name
 - Added `volume: f32` field to track playback volume (default 1.0 = 100%)
+- Added `playback_start: Option<std::time::Instant>` field to track elapsed playback time
 
 ### 3. Vim Key Bindings
 Implemented the following vim-style keybindings when `--vim` flag is enabled:
@@ -89,6 +90,21 @@ All vim keybindings work correctly in modal contexts:
 - Status message displays current volume percentage
 - Volume state persists across feed changes
 - Help modal updated with volume control keybindings
+
+### 11. Playback Timer Display
+- Added elapsed playback time counter in the status bar
+- Shows format: "Playing: [ID] Title [MM:SS]"
+- Timer updates in real-time as audio plays
+- Timer resets when playback stops or switches to a different feed
+- Uses `playback_start: Option<std::time::Instant>` to track playback duration
+- Calculates elapsed time as minutes:seconds display
+
+### 12. State Preservation Across Data Fetches
+- Fixed issue where playback state was lost during periodic feed list refreshes
+- Now preserves `playing_feed_id`, `playing_feed_title`, `playback_start`, and `volume` across data updates
+- EQ analyzer continues working properly without interruption
+- Playback timer keeps running smoothly through feed updates
+- Audio playback unaffected by background polling
 
 ## Usage
 

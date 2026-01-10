@@ -454,6 +454,10 @@ async fn main() -> Result<()> {
             let audio_stream = app.audio_stream.take();
             let audio_sink = app.audio_sink.take();
             let temp_audio_path = app.temp_audio_path.take();
+            let playing_feed_id = app.playing_feed_id;
+            let playing_feed_title = app.playing_feed_title.take();
+            let playback_start = app.playback_start;
+            let volume = app.volume;
             // Apply incoming update
             app.feeds = new_state.feeds;
             app.last_updated = new_state.last_updated;
@@ -471,10 +475,14 @@ async fn main() -> Result<()> {
             } else {
                 app.selected = selected.min(app.feeds.len() - 1);
             }
-            // Restore audio state
+            // Restore audio state and playback tracking
             app.audio_stream = audio_stream;
             app.audio_sink = audio_sink;
             app.temp_audio_path = temp_audio_path;
+            app.playing_feed_id = playing_feed_id;
+            app.playing_feed_title = playing_feed_title;
+            app.playback_start = playback_start;
+            app.volume = volume;
         }
 
         // Handle UI messages like playback
