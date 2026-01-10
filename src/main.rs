@@ -271,10 +271,12 @@ struct AppState {
     reason_modal: bool,
     reason_index: usize,
     pending_problem_feed_id: Option<u64>,
+    // Vim mode flag
+    vim_mode: bool,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(vim_mode: bool) -> Self {
         Self {
             feeds: Vec::new(),
             scroll: 0,
@@ -295,6 +297,7 @@ impl AppState {
             reason_modal: false,
             reason_index: 0,
             pending_problem_feed_id: None,
+            vim_mode,
         }
     }
 
@@ -344,6 +347,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Parse command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    let vim_mode = args.iter().any(|arg| arg == "--vim");
+
     // Ensure we're running in a real terminal (TTY). Many IDE "Run" consoles are not TTYs
     // and Ratatui won't be able to draw there, which looks like a blank window.
     if !std::io::stdout().is_terminal() {
@@ -371,7 +378,7 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AppUpdate>();
     // UI message channel for async helpers like playback
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
-    let mut app = AppState::new();
+    let mut app = AppState::new(vim_mode);
 
     // Spawn background task to periodically fetch
     let tx_clone = tx.clone();
@@ -823,6 +830,143 @@ async fn main() -> Result<()> {
                     }
                     match k.code {
                         KeyCode::Char('q') => break,
+                        // Vim mode space for play
+                        KeyCode::Char(' ') if app.vim_mode => {
+                            if let Some(feed) = app.feeds.get(app.selected) {
+                                if let Some(feed_url) = feed.url.clone() {
+                                    app.status_msg = "Fetching feed…".into();
+                                    let ui_tx2 = ui_tx.clone();
+                                    tokio::spawn(async move {
+                                        let _ = fetch_play_latest(feed_url, ui_tx2).await;
+                                    });
+                                } else {
+                                    app.status_msg = "Selected feed has no URL".into();
+                                }
+                            }
+                        }
+                        // Vim mode j for down
+                        KeyCode::Char('j') if app.vim_mode => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let max_scroll = {
+                                        let lines = app.xml_text.lines().count();
+                                        lines.saturating_sub(visible_rows)
+                                    };
+                                    let next = (app.xml_scroll as usize + 1).min(max_scroll);
+                                    app.xml_scroll = next as u16;
+                                } else {
+                                    let feed_opt = app.feeds.get(app.selected);
+                                    let max_scroll = if let Some(feed) = feed_opt {
+                                        let desc = feed.description.clone().unwrap_or_default();
+                                        let lines = desc.lines().count() + 5;
+                                        lines.saturating_sub(visible_rows)
+                                    } else { 0 };
+                                    let next = (app.popup_scroll as usize + 1).min(max_scroll);
+                                    app.popup_scroll = next as u16;
+                                }
+                                continue;
+                            }
+                            if app.selected + 1 < app.feeds.len() {
+                                app.selected += 1;
+                                let bottom = app.scroll + viewport_items;
+                                if app.selected >= bottom {
+                                    app.scroll = app.selected.saturating_sub(viewport_items - 1);
+                                }
+                            }
+                        }
+                        // Vim mode k for up
+                        KeyCode::Char('k') if app.vim_mode => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let max_scroll = {
+                                        let lines = app.xml_text.lines().count();
+                                        lines.saturating_sub(visible_rows)
+                                    };
+                                    if app.xml_scroll > 0 {
+                                        app.xml_scroll -= 1;
+                                    }
+                                    if app.xml_scroll > max_scroll as u16 {
+                                        app.xml_scroll = max_scroll as u16;
+                                    }
+                                } else {
+                                    let feed_opt = app.feeds.get(app.selected);
+                                    let max_scroll = if let Some(feed) = feed_opt {
+                                        let desc = feed.description.clone().unwrap_or_default();
+                                        let lines = desc.lines().count() + 5;
+                                        lines.saturating_sub(visible_rows)
+                                    } else { 0 };
+                                    if app.popup_scroll > 0 {
+                                        app.popup_scroll -= 1;
+                                    }
+                                    if app.popup_scroll > max_scroll as u16 {
+                                        app.popup_scroll = max_scroll as u16;
+                                    }
+                                }
+                                continue;
+                            }
+                            if app.selected > 0 {
+                                app.selected -= 1;
+                                if app.selected < app.scroll {
+                                    app.scroll = app.selected;
+                                }
+                            }
+                        }
+                        // Vim mode h for left (acts like Home)
+                        KeyCode::Char('h') if app.vim_mode => {
+                            if app.xml_show || app.show_popup {
+                                if app.xml_show { app.xml_scroll = 0; } else { app.popup_scroll = 0; }
+                                continue;
+                            }
+                            app.selected = 0;
+                            app.scroll = 0;
+                        }
+                        // Vim mode l for right (acts like End)
+                        KeyCode::Char('l') if app.vim_mode => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let max_scroll = {
+                                        let lines = app.xml_text.lines().count();
+                                        lines.saturating_sub(visible_rows)
+                                    };
+                                    app.xml_scroll = max_scroll.max(0) as u16;
+                                } else {
+                                    let feed_opt = app.feeds.get(app.selected);
+                                    let max_scroll = if let Some(feed) = feed_opt {
+                                        let desc = feed.description.clone().unwrap_or_default();
+                                        let lines = desc.lines().count() + 5;
+                                        lines.saturating_sub(visible_rows)
+                                    } else { 0 };
+                                    app.popup_scroll = max_scroll.max(0) as u16;
+                                }
+                                continue;
+                            }
+                            if !app.feeds.is_empty() {
+                                app.selected = app.feeds.len() - 1;
+                                let max_scroll = app
+                                    .feeds
+                                    .len()
+                                    .saturating_sub(viewport_items);
+                                app.scroll = max_scroll;
+                            }
+                        }
                         KeyCode::Esc => {
                             if app.xml_show {
                                 app.xml_show = false;
@@ -844,6 +988,85 @@ async fn main() -> Result<()> {
                             tokio::spawn(async move {
                                 let _ = poll_for_new_feeds(tx2).await;
                             });
+                        }
+                        // Ctrl-n for next (vim mode)
+                        KeyCode::Char('n') if app.vim_mode && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let max_scroll = {
+                                        let lines = app.xml_text.lines().count();
+                                        lines.saturating_sub(visible_rows)
+                                    };
+                                    let next = (app.xml_scroll as usize + 1).min(max_scroll);
+                                    app.xml_scroll = next as u16;
+                                } else {
+                                    let feed_opt = app.feeds.get(app.selected);
+                                    let max_scroll = if let Some(feed) = feed_opt {
+                                        let desc = feed.description.clone().unwrap_or_default();
+                                        let lines = desc.lines().count() + 5;
+                                        lines.saturating_sub(visible_rows)
+                                    } else { 0 };
+                                    let next = (app.popup_scroll as usize + 1).min(max_scroll);
+                                    app.popup_scroll = next as u16;
+                                }
+                                continue;
+                            }
+                            if app.selected + 1 < app.feeds.len() {
+                                app.selected += 1;
+                                let bottom = app.scroll + viewport_items;
+                                if app.selected >= bottom {
+                                    app.scroll = app.selected.saturating_sub(viewport_items - 1);
+                                }
+                            }
+                        }
+                        // Ctrl-p for previous (vim mode)
+                        KeyCode::Char('p') if app.vim_mode && k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                            if app.xml_show || app.show_popup {
+                                let modal_area = if app.xml_show {
+                                    centered_rect(80, 70, term_rect)
+                                } else {
+                                    centered_rect(70, 60, term_rect)
+                                };
+                                let visible_rows: usize = modal_area.height.saturating_sub(2) as usize;
+                                if app.xml_show {
+                                    let max_scroll = {
+                                        let lines = app.xml_text.lines().count();
+                                        lines.saturating_sub(visible_rows)
+                                    };
+                                    if app.xml_scroll > 0 {
+                                        app.xml_scroll -= 1;
+                                    }
+                                    if app.xml_scroll > max_scroll as u16 {
+                                        app.xml_scroll = max_scroll as u16;
+                                    }
+                                } else {
+                                    let feed_opt = app.feeds.get(app.selected);
+                                    let max_scroll = if let Some(feed) = feed_opt {
+                                        let desc = feed.description.clone().unwrap_or_default();
+                                        let lines = desc.lines().count() + 5;
+                                        lines.saturating_sub(visible_rows)
+                                    } else { 0 };
+                                    if app.popup_scroll > 0 {
+                                        app.popup_scroll -= 1;
+                                    }
+                                    if app.popup_scroll > max_scroll as u16 {
+                                        app.popup_scroll = max_scroll as u16;
+                                    }
+                                }
+                                continue;
+                            }
+                            if app.selected > 0 {
+                                app.selected -= 1;
+                                if app.selected < app.scroll {
+                                    app.scroll = app.selected;
+                                }
+                            }
                         }
                         KeyCode::Char('p') => {
                             if let Some(feed) = app.feeds.get(app.selected) {
