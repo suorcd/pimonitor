@@ -69,6 +69,13 @@ All vim keybindings work correctly in modal contexts:
 - Playing info appears in the status bar after the status message, separated by " | "
 - Styled with green bold text for easy visibility
 
+### 9. Panic-Safe Audio Playback
+- Wrapped rodio/symphonia decoder initialization in panic handler
+- Catches decoder panics and converts them to friendly error messages
+- Prevents application crashes when encountering unsupported audio formats
+- Shows "Audio decoder panic - this audio format may not be supported" error
+- Application continues running even if playback fails
+
 ## Usage
 
 Run the application with vim keybindings:

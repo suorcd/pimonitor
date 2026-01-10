@@ -1766,6 +1766,8 @@ async fn download_to_temp(url: &str) -> Result<PathBuf> {
 }
 
 fn start_playback_from_file(path: &PathBuf) -> Result<(OutputStream, Sink)> {
+    use std::panic;
+    
     // Keep OutputStream alive together with Sink
     let (stream, handle) = OutputStream::try_default()?;
     let sink = Sink::try_new(&handle)?;
@@ -1777,7 +1779,17 @@ fn start_playback_from_file(path: &PathBuf) -> Result<(OutputStream, Sink)> {
     file.read_to_end(&mut buf)?;
     let cursor = Cursor::new(buf);
 
-    let decoder = rodio::Decoder::new(cursor)?;
+    // Catch panics from rodio/symphonia decoder initialization
+    let decoder_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        rodio::Decoder::new(cursor)
+    }));
+    
+    let decoder = match decoder_result {
+        Ok(Ok(dec)) => dec,
+        Ok(Err(e)) => return Err(anyhow::anyhow!("Decoder error: {}", e)),
+        Err(_) => return Err(anyhow::anyhow!("Audio decoder panic - this audio format may not be supported")),
+    };
+    
     sink.append(decoder);
     sink.play();
     Ok((stream, sink))
