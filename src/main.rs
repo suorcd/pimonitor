@@ -266,6 +266,7 @@ struct AppState {
     temp_audio_path: Option<PathBuf>,
     playing_feed_id: Option<u64>,
     playing_feed_title: Option<String>,
+    volume: f32,
     // EQ UI state
     eq_levels: [f32; 12],
     eq_visible: bool,
@@ -298,6 +299,7 @@ impl AppState {
             temp_audio_path: None,
             playing_feed_id: None,
             playing_feed_title: None,
+            volume: 1.0,
             eq_levels: [0.0; 12],
             eq_visible: false,
             reason_modal: false,
@@ -747,6 +749,8 @@ async fn main() -> Result<()> {
                     Line::from(""),
                     Line::from(Span::styled("Actions:", Style::default().add_modifier(Modifier::BOLD))),
                     Line::from("  Space       - Play/pause toggle"),
+                    Line::from("  -           - Volume down"),
+                    Line::from("  =           - Volume up"),
                     Line::from("  Enter       - View feed details"),
                     Line::from("  x           - View feed XML"),
                     Line::from("  r           - Refresh feed list"),
@@ -899,6 +903,22 @@ async fn main() -> Result<()> {
                         // Vim mode ? for help
                         KeyCode::Char('?') if app.vim_mode => {
                             app.help_modal = !app.help_modal;
+                        }
+                        // Volume down with -
+                        KeyCode::Char('-') => {
+                            app.volume = (app.volume - 0.1).max(0.0);
+                            if let Some(sink) = &app.audio_sink {
+                                sink.set_volume(app.volume);
+                            }
+                            app.status_msg = format!("Volume: {}%", (app.volume * 100.0) as u8);
+                        }
+                        // Volume up with =
+                        KeyCode::Char('=') => {
+                            app.volume = (app.volume + 0.1).min(2.0);
+                            if let Some(sink) = &app.audio_sink {
+                                sink.set_volume(app.volume);
+                            }
+                            app.status_msg = format!("Volume: {}%", (app.volume * 100.0) as u8);
                         }
                         // Vim mode space for play/pause toggle
                         KeyCode::Char(' ') if app.vim_mode => {
