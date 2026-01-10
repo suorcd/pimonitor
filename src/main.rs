@@ -830,17 +830,29 @@ async fn main() -> Result<()> {
                     }
                     match k.code {
                         KeyCode::Char('q') => break,
-                        // Vim mode space for play
+                        // Vim mode space for play/pause toggle
                         KeyCode::Char(' ') if app.vim_mode => {
-                            if let Some(feed) = app.feeds.get(app.selected) {
-                                if let Some(feed_url) = feed.url.clone() {
-                                    app.status_msg = "Fetching feed…".into();
-                                    let ui_tx2 = ui_tx.clone();
-                                    tokio::spawn(async move {
-                                        let _ = fetch_play_latest(feed_url, ui_tx2).await;
-                                    });
+                            // Check if audio is currently playing or paused
+                            if let Some(sink) = &app.audio_sink {
+                                if sink.is_paused() {
+                                    sink.play();
+                                    app.status_msg = "Playback resumed".into();
                                 } else {
-                                    app.status_msg = "Selected feed has no URL".into();
+                                    sink.pause();
+                                    app.status_msg = "Playback paused".into();
+                                }
+                            } else {
+                                // No audio loaded, start playing the selected feed
+                                if let Some(feed) = app.feeds.get(app.selected) {
+                                    if let Some(feed_url) = feed.url.clone() {
+                                        app.status_msg = "Fetching feed…".into();
+                                        let ui_tx2 = ui_tx.clone();
+                                        tokio::spawn(async move {
+                                            let _ = fetch_play_latest(feed_url, ui_tx2).await;
+                                        });
+                                    } else {
+                                        app.status_msg = "Selected feed has no URL".into();
+                                    }
                                 }
                             }
                         }

@@ -27,7 +27,10 @@ Implemented the following vim-style keybindings when `--vim` flag is enabled:
 - **Ctrl-p**: Previous item/scroll up (equivalent to Up arrow)
 
 #### Actions
-- **Space**: Play the latest episode of the selected feed (equivalent to 'p' key)
+- **Space**: Play/Pause toggle
+  - If audio is currently playing, pauses playback
+  - If audio is paused, resumes playback
+  - If no audio is loaded, starts playing the latest episode of the selected feed
 
 ### 4. Modal Scroll Support
 All vim keybindings work correctly in modal contexts:
@@ -58,3 +61,8 @@ cargo run
 - Test vim keybindings within the feed details popup
 - Verify that standard keybindings still work in both modes
 - Test Ctrl-p and Ctrl-n combinations
+- Test space bar play/pause toggle functionality:
+  - Press space to start playback
+  - Press space again to pause
+  - Press space once more to resume
+  - Verify status messages update correctly
