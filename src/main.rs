@@ -35,6 +35,7 @@ use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use sha1::{Sha1, Digest};
 use pimonitor::{reason_options, reason_code_for_index};
+use std::collections::{HashMap, HashSet};
 
 // Global configuration flags populated from pimonitor.yaml
 // Default polling interval is 60 seconds
@@ -279,6 +280,9 @@ struct AppState {
     vim_mode: bool,
     // Help modal
     help_modal: bool,
+    // App start time and ephemeral new markers
+    start_time: std::time::Instant,
+    new_feed_marks: HashMap<u64, std::time::Instant>,
 }
 
 impl AppState {
@@ -309,6 +313,8 @@ impl AppState {
             pending_problem_feed_id: None,
             vim_mode,
             help_modal: false,
+            start_time: std::time::Instant::now(),
+            new_feed_marks: HashMap::new(),
         }
     }
 
@@ -458,11 +464,27 @@ async fn main() -> Result<()> {
             let playing_feed_title = app.playing_feed_title.take();
             let playback_start = app.playback_start;
             let volume = app.volume;
+            // Capture previously seen feed IDs
+            let mut prev_ids: HashSet<u64> = HashSet::new();
+            for f in app.feeds.iter() {
+                if let Some(id) = f.id { prev_ids.insert(id); }
+            }
             // Apply incoming update
             app.feeds = new_state.feeds;
             app.last_updated = new_state.last_updated;
             app.source = new_state.source;
             app.status_msg = new_state.status_msg;
+            // Mark newly added feeds with a temporary star if beyond first minute
+            let now = std::time::Instant::now();
+            if now.duration_since(app.start_time) >= std::time::Duration::from_secs(60) {
+                for f in app.feeds.iter() {
+                    if let Some(id) = f.id {
+                        if !prev_ids.contains(&id) {
+                            app.new_feed_marks.insert(id, now + std::time::Duration::from_secs(60));
+                        }
+                    }
+                }
+            }
             // Clamp preserved scroll so the last item remains visible when list shrinks.
             let max_scroll = app
                 .feeds
@@ -564,6 +586,9 @@ async fn main() -> Result<()> {
                         Constraint::Length(4), // status (2 inner lines; +2 borders)
                     ])
                     .split(size);
+            // Prune expired new markers
+            let now = std::time::Instant::now();
+            app.new_feed_marks.retain(|_, exp| *exp > now);
 
             
             // Render scrolling by using a viewport via Paragraph/List with offset isn't native; we can slice
@@ -584,9 +609,16 @@ async fn main() -> Result<()> {
                         .id
                         .map(|i| i.to_string())
                         .unwrap_or_else(|| "?".into());
+                    let now = std::time::Instant::now();
+                    let is_new_mark = feed.id
+                        .and_then(|i| app.new_feed_marks.get(&i).copied())
+                        .map(|exp| exp > now)
+                        .unwrap_or(false);
 
                     // First line: [id]. [title] ([language]) - [url]
-                    let line1 = Line::from(vec![
+                    let mut parts = Vec::new();
+                    if is_new_mark { parts.push(Span::styled("*", Style::default().fg(Color::Green))); parts.push(Span::raw(" ")); }
+                    parts.extend_from_slice(&[
                         Span::styled(format!("{}.", id_str), Style::default().fg(Color::Yellow)),
                         Span::raw(" "),
                         Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
@@ -594,6 +626,7 @@ async fn main() -> Result<()> {
                         Span::raw(" - "),
                         Span::styled(url, Style::default().fg(Color::Cyan)),
                     ]);
+                    let line1 = Line::from(parts);
 
                     // Second line: link
                     let line2 = Line::from(vec![
@@ -779,6 +812,10 @@ async fn main() -> Result<()> {
                     Line::from("  q           - Quit"),
                     Line::from("  Esc         - Close modal / stop playback"),
                     Line::from("  ?           - Show this help"),
+                    Line::from(""),
+                    Line::from(Span::styled("Indicators:", Style::default().add_modifier(Modifier::BOLD))),
+                    Line::from("  *           - New feed marker (shows for 1 minute)"),
+                    Line::from("                Appears for feeds fetched after the first minute"),
                     Line::from(""),
                     Line::from(Span::styled(
                         "Press Esc or ? to close",
