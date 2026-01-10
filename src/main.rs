@@ -266,6 +266,10 @@ struct AppState {
     // EQ UI state
     eq_levels: [f32; 12],
     eq_visible: bool,
+    // Problematic reason selection modal
+    reason_modal: bool,
+    reason_index: usize,
+    pending_problem_feed_id: Option<u64>,
 }
 
 impl AppState {
@@ -287,6 +291,9 @@ impl AppState {
             temp_audio_path: None,
             eq_levels: [0.0; 12],
             eq_visible: false,
+            reason_modal: false,
+            reason_index: 0,
+            pending_problem_feed_id: None,
         }
     }
 
@@ -591,7 +598,7 @@ async fn main() -> Result<()> {
             let status_text = vec![
                 // Top line: key commands and metadata
                 Line::from(vec![
-                    Span::raw("q: quit  r: refresh  p: play latest  x: view XML  Esc: stop/close  ↑/↓: select  Enter: open  PgUp/PgDn/Home/End: nav  "),
+                    Span::raw("q: quit  r: refresh  p: play latest  x: view XML  d: report problematic  Esc: stop/close  ↑/↓: select  Enter: open  PgUp/PgDn/Home/End: nav  "),
                     Span::styled(
                         format!("Updated: {}  Source: {}", updated, src),
                         Style::default().fg(Color::Yellow),
@@ -667,6 +674,39 @@ async fn main() -> Result<()> {
                 f.render_widget(popup, area);
             }
 
+            // Problematic reason selection modal
+            if app.reason_modal {
+                let area = centered_rect(60, 60, size);
+                let reasons: [(&str, u8); 6] = [
+                    ("Dead", 0),
+                    ("Spam", 1),
+                    ("Slop", 2),
+                    ("Illegal", 3),
+                    ("Duplicate", 4),
+                    ("Malicious", 5),
+                ];
+                let mut items: Vec<ListItem> = Vec::new();
+                for (label, code) in reasons.iter() {
+                    let line = Line::from(vec![
+                        Span::styled(format!("{}: {}", code, label), Style::default()),
+                    ]);
+                    items.push(ListItem::new(line));
+                }
+                let mut list_state = ratatui::widgets::ListState::default();
+                list_state.select(Some(app.reason_index));
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow))
+                            .title(Span::styled("Select reason (Enter=confirm, Esc=cancel)", Style::default().fg(Color::Yellow))),
+                    )
+                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+                    .highlight_symbol("▶ ");
+                f.render_widget(Clear, area);
+                f.render_stateful_widget(list, area, &mut list_state);
+            }
+
             // Draw EQ widget in bottom-right corner only while audio is playing
             if app.is_playing() {
                 // For 12 bars with bar_width=2 and gap=1 → ~12*3=36 + borders => ~40-44
@@ -704,6 +744,48 @@ async fn main() -> Result<()> {
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press {
+                    // If reason selection modal is open, handle its navigation first
+                    if app.reason_modal {
+                        match k.code {
+                            KeyCode::Esc => {
+                                app.reason_modal = false;
+                                app.pending_problem_feed_id = None;
+                                app.status_msg = "Canceled problematic report".into();
+                            }
+                            KeyCode::Up => {
+                                if app.reason_index > 0 { app.reason_index -= 1; }
+                            }
+                            KeyCode::Down => {
+                                if app.reason_index < 5 { app.reason_index += 1; }
+                            }
+                            KeyCode::Enter => {
+                                if let Some(feed_id) = app.pending_problem_feed_id.take() {
+                                    app.reason_modal = false;
+                                    let sel = app.reason_index;
+                                    let reason_code: u8 = match sel { 0=>0,1=>1,2=>2,3=>3,4=>4,_=>5 };
+                                    app.status_msg = format!("Reporting feed {} as problematic (reason {})…", feed_id, reason_code);
+                                    let ui_tx2 = ui_tx.clone();
+                                    let tx2 = tx.clone();
+                                    tokio::spawn(async move {
+                                        match pi_report_problematic(feed_id, reason_code).await {
+                                            Ok(desc) => {
+                                                let _ = ui_tx2.send(UiMsg::Status(format!("Problematic reported: {}", desc)));
+                                                let _ = poll_for_new_feeds(tx2).await;
+                                            }
+                                            Err(e) => {
+                                                let _ = ui_tx2.send(UiMsg::Status(format!("Report failed: {}", e)));
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    app.reason_modal = false;
+                                }
+                            }
+                            _ => {}
+                        }
+                        // Skip other handlers while modal is active
+                        continue;
+                    }
                     match k.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Esc => {
@@ -713,6 +795,9 @@ async fn main() -> Result<()> {
                             } else if app.show_popup {
                                 app.show_popup = false;
                                 app.popup_scroll = 0;
+                            } else if app.reason_modal {
+                                app.reason_modal = false;
+                                app.pending_problem_feed_id = None;
                             } else if app.is_playing() || app.audio_sink.is_some() {
                                 app.stop_playback();
                             }
@@ -761,21 +846,10 @@ async fn main() -> Result<()> {
                                 app.status_msg = "Read/write disabled: missing API credentials".into();
                             } else if let Some(feed) = app.feeds.get(app.selected) {
                                 if let Some(feed_id) = feed.id {
-                                    app.status_msg = format!("Reporting feed {} as problematic…", feed_id);
-                                    let ui_tx2 = ui_tx.clone();
-                                    let tx2 = tx.clone();
-                                    tokio::spawn(async move {
-                                        match pi_report_problematic(feed_id).await {
-                                            Ok(desc) => {
-                                                let _ = ui_tx2.send(UiMsg::Status(format!("Problematic reported: {}", desc)));
-                                                // On success, refresh the feed list by polling again.
-                                                let _ = poll_for_new_feeds(tx2).await;
-                                            }
-                                            Err(e) => {
-                                                let _ = ui_tx2.send(UiMsg::Status(format!("Report failed: {}", e)));
-                                            }
-                                        }
-                                    });
+                                    // Open reason selection modal
+                                    app.pending_problem_feed_id = Some(feed_id);
+                                    app.reason_index = 0; // default to Dead=0
+                                    app.reason_modal = true;
                                 } else {
                                     app.status_msg = "Selected feed has no id".into();
                                 }
@@ -1084,8 +1158,8 @@ fn build_pi_auth_headers(key: &str, secret: &str, now_unix: i64) -> (String, Str
 }
 
 // Report a feed as problematic to Podcast Index.
-// Uses POST https://api.podcastindex.org/api/1.0/report/problematic?id=<feed_id>
-async fn pi_report_problematic(feed_id: u64) -> Result<String> {
+// Uses POST https://api.podcastindex.org/api/1.0/report/problematic?id=<feed_id>&reason=<0..5>
+async fn pi_report_problematic(feed_id: u64, reason: u8) -> Result<String> {
     let (key, secret) = load_pi_creds()
         .ok_or_else(|| anyhow::anyhow!("API credentials missing in pimonitor.yaml"))?;
 
@@ -1094,7 +1168,7 @@ async fn pi_report_problematic(feed_id: u64) -> Result<String> {
     let client = reqwest::Client::new();
     let resp = client
         .post("https://api.podcastindex.org/api/1.0/report/problematic")
-        .query(&[("id", feed_id)])
+        .query(&[("id", feed_id.to_string()), ("reason", reason.to_string())])
         .header("User-Agent", "pimonitor/0.1")
         .header("X-Auth-Key", x_key)
         .header("X-Auth-Date", x_date)
