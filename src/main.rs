@@ -34,6 +34,7 @@ use tokio::time::interval;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use sha1::{Sha1, Digest};
+use pimonitor::{reason_options, reason_code_for_index};
 
 // Global configuration flags populated from pimonitor.yaml
 // Default polling interval is 60 seconds
@@ -677,14 +678,7 @@ async fn main() -> Result<()> {
             // Problematic reason selection modal
             if app.reason_modal {
                 let area = centered_rect(60, 60, size);
-                let reasons: [(&str, u8); 6] = [
-                    ("Dead", 0),
-                    ("Spam", 1),
-                    ("Slop", 2),
-                    ("Illegal", 3),
-                    ("Duplicate", 4),
-                    ("Malicious", 5),
-                ];
+                let reasons = reason_options();
                 let mut items: Vec<ListItem> = Vec::new();
                 for (label, code) in reasons.iter() {
                     let line = Line::from(vec![
@@ -756,13 +750,15 @@ async fn main() -> Result<()> {
                                 if app.reason_index > 0 { app.reason_index -= 1; }
                             }
                             KeyCode::Down => {
-                                if app.reason_index < 5 { app.reason_index += 1; }
+                                // Clamp to last index of reasons list
+                                let last = reason_options().len().saturating_sub(1);
+                                if app.reason_index < last { app.reason_index += 1; }
                             }
                             KeyCode::Enter => {
                                 if let Some(feed_id) = app.pending_problem_feed_id.take() {
                                     app.reason_modal = false;
                                     let sel = app.reason_index;
-                                    let reason_code: u8 = match sel { 0=>0,1=>1,2=>2,3=>3,4=>4,_=>5 };
+                                    let reason_code: u8 = reason_code_for_index(sel);
                                     app.status_msg = format!("Reporting feed {} as problematic (reason {})…", feed_id, reason_code);
                                     let ui_tx2 = ui_tx.clone();
                                     let tx2 = tx.clone();
@@ -773,6 +769,7 @@ async fn main() -> Result<()> {
                                                 let _ = poll_for_new_feeds(tx2).await;
                                             }
                                             Err(e) => {
+                                                eprintln!("Problematic report failed: {}", e);
                                                 let _ = ui_tx2.send(UiMsg::Status(format!("Report failed: {}", e)));
                                             }
                                         }
@@ -848,7 +845,7 @@ async fn main() -> Result<()> {
                                 if let Some(feed_id) = feed.id {
                                     // Open reason selection modal
                                     app.pending_problem_feed_id = Some(feed_id);
-                                    app.reason_index = 0; // default to Dead=0
+                                    app.reason_index = 0; // default to "No Reason" (0)
                                     app.reason_modal = true;
                                 } else {
                                     app.status_msg = "Selected feed has no id".into();

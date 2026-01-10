@@ -3,6 +3,9 @@ use serde_yaml::Value as YamlValue;
 use std::fs::File;
 use std::path::Path;
 
+// =========================
+// Podcast Index auth helpers
+// =========================
 // Public helper to build PodcastIndex auth headers components.
 // Returns (x_auth_key, x_auth_date, authorization)
 pub fn build_pi_auth_headers(key: &str, secret: &str, now_unix: i64) -> (String, String, String) {
@@ -37,4 +40,28 @@ pub fn load_pi_creds_from(path: &Path) -> Option<(String, String)> {
         (Some(k), Some(s)) => Some((k, s)),
         _ => None,
     }
+}
+
+// =========================
+// Problematic reason helpers
+// =========================
+// Returns the list of problematic reasons (label, code) per AGENTS.md.
+// Index positions correspond to UI selection order.
+pub fn reason_options() -> Vec<(&'static str, u8)> {
+    vec![
+        ("No Reason", 0),
+        ("Spam", 1),
+        ("AI Slop", 2),
+        ("Illegal Content", 3),
+        ("Duplicate", 4),
+        ("Malicious Payload", 5),
+        ("Feed Hijack", 6),
+    ]
+}
+
+// Given a UI index, return the corresponding reason code, clamped to the valid range.
+pub fn reason_code_for_index(idx: usize) -> u8 {
+    let opts = reason_options();
+    let i = idx.min(opts.len().saturating_sub(1));
+    opts[i].1
 }
