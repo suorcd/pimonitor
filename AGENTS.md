@@ -23,6 +23,8 @@
   - `Malicious Payload` translates to `reason` value of `5`
   - `Feed Hijack` translates to `reason` value of `6`
 - The `reason` value selected by the user should be sent as a url parameter called `reason` in the call to the '/report/problematic' endpoint.
+- In the reason selection dialog box, the user should be able to select the reason by pressing the corresponding number key (0-6) or using the arrow keys to navigate and Enter to confirm.
+
 
 ## Unit testing
 - When new functions are created, write a unit test for them.

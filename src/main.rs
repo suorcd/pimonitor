@@ -754,6 +754,44 @@ async fn main() -> Result<()> {
                                 let last = reason_options().len().saturating_sub(1);
                                 if app.reason_index < last { app.reason_index += 1; }
                             }
+                            // Direct numeric selection (0-6) per AGENTS.md
+                            KeyCode::Char('0') | KeyCode::Char('1') | KeyCode::Char('2') |
+                            KeyCode::Char('3') | KeyCode::Char('4') | KeyCode::Char('5') |
+                            KeyCode::Char('6') => {
+                                if let Some(feed_id) = app.pending_problem_feed_id.take() {
+                                    // Map char to index and submit immediately
+                                    let idx = match k.code {
+                                        KeyCode::Char('0') => 0,
+                                        KeyCode::Char('1') => 1,
+                                        KeyCode::Char('2') => 2,
+                                        KeyCode::Char('3') => 3,
+                                        KeyCode::Char('4') => 4,
+                                        KeyCode::Char('5') => 5,
+                                        KeyCode::Char('6') => 6,
+                                        _ => 0,
+                                    };
+                                    app.reason_index = idx;
+                                    app.reason_modal = false;
+                                    let reason_code: u8 = reason_code_for_index(idx);
+                                    app.status_msg = format!("Reporting feed {} as problematic (reason {})…", feed_id, reason_code);
+                                    let ui_tx2 = ui_tx.clone();
+                                    let tx2 = tx.clone();
+                                    tokio::spawn(async move {
+                                        match pi_report_problematic(feed_id, reason_code).await {
+                                            Ok(desc) => {
+                                                let _ = ui_tx2.send(UiMsg::Status(format!("Problematic reported: {}", desc)));
+                                                let _ = poll_for_new_feeds(tx2).await;
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Problematic report failed: {}", e);
+                                                let _ = ui_tx2.send(UiMsg::Status(format!("Report failed: {}", e)));
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    app.reason_modal = false;
+                                }
+                            }
                             KeyCode::Enter => {
                                 if let Some(feed_id) = app.pending_problem_feed_id.take() {
                                     app.reason_modal = false;
