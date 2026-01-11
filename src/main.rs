@@ -33,6 +33,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use sha1::{Sha1, Digest};
 use pimonitor::{reason_options, reason_code_for_index};
 use std::collections::{HashMap, HashSet};
@@ -42,6 +43,8 @@ use std::collections::{HashMap, HashSet};
 static POLL_INTERVAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(60));
 // Whether both API key and secret are present (read/write possible)
 static PI_READ_WRITE: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+// Path to the config file (default: pimonitor.yaml, can be overridden with --config)
+static CONFIG_PATH: Lazy<Mutex<PathBuf>> = Lazy::new(|| Mutex::new(PathBuf::from("pimonitor.yaml")));
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {
@@ -82,7 +85,13 @@ fn evaluate_config(cfg: &AppConfig) -> (u64, bool) {
 
 fn read_yaml_config() {
     // Read configuration from pimonitor.yaml before each polling cycle
-    let path = PathBuf::from("pimonitor.yaml");
+    // Use the path from CONFIG_PATH global, which can be overridden with --config
+    let path = if let Ok(cp) = CONFIG_PATH.lock() {
+        cp.clone()
+    } else {
+        PathBuf::from("pimonitor.yaml")
+    };
+    
     let mut interval_secs: u64 = 60; // default
     let mut can_rw = false; // default to false unless both present
 
@@ -196,6 +205,61 @@ mod tests {
         ensure_config_exists_at(&p).expect("no overwrite");
         let after = fs::read_to_string(&p).unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn config_path_file_exists_and_readable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("pimonitor.yaml");
+        // Create a valid config file
+        let mut f = File::create(&p).expect("create file");
+        write!(f, "pi_api_key: \"test\"\npi_api_secret: \"test\"\n").unwrap();
+        drop(f);
+        
+        // Verify file exists
+        assert!(p.exists());
+        
+        // Verify file is readable
+        let contents = fs::read(&p);
+        assert!(contents.is_ok());
+        assert!(!contents.unwrap().is_empty());
+    }
+
+    #[test]
+    fn config_path_nonexistent_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("nonexistent.yaml");
+        
+        // Verify file does not exist
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn load_pi_creds_from_custom_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("custom_config.yaml");
+        let mut f = File::create(&p).expect("create file");
+        write!(f, "pi_api_key: \"my_key\"\npi_api_secret: \"my_secret\"\n").unwrap();
+        drop(f);
+        
+        let creds = load_pi_creds_from(&p);
+        assert!(creds.is_some());
+        let (key, secret) = creds.unwrap();
+        assert_eq!(key, "my_key");
+        assert_eq!(secret, "my_secret");
+    }
+
+    #[test]
+    fn load_pi_creds_missing_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("incomplete_config.yaml");
+        let mut f = File::create(&p).expect("create file");
+        write!(f, "pi_api_key: \"my_key\"\npi_api_secret: \"\"\n").unwrap();
+        drop(f);
+        
+        let creds = load_pi_creds_from(&p);
+        // Should return None because secret is empty
+        assert!(creds.is_none());
     }
 }
 
@@ -370,6 +434,38 @@ async fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let vim_mode = args.iter().any(|arg| arg == "--vim");
+    
+    // Parse --config flag for custom config file path
+    let config_path = if let Some(pos) = args.iter().position(|arg| arg == "--config") {
+        if pos + 1 < args.len() {
+            let path = PathBuf::from(&args[pos + 1]);
+            // Validate that the file exists and is readable
+            if !path.exists() {
+                eprintln!("Error: config file '{}' does not exist", path.display());
+                return Ok(());
+            }
+            // Try to read the file to ensure it's readable
+            match std::fs::read(&path) {
+                Ok(_) => {
+                    // Update the global CONFIG_PATH
+                    if let Ok(mut cp) = CONFIG_PATH.lock() {
+                        *cp = path.clone();
+                    }
+                    path
+                }
+                Err(e) => {
+                    eprintln!("Error: cannot read config file '{}': {}", path.display(), e);
+                    return Ok(());
+                }
+            }
+        } else {
+            eprintln!("Error: --config flag requires a path argument");
+            return Ok(());
+        }
+    } else {
+        // Use default path
+        PathBuf::from("pimonitor.yaml")
+    };
 
     // Ensure we're running in a real terminal (TTY). Many IDE "Run" consoles are not TTYs
     // and Ratatui won't be able to draw there, which looks like a blank window.
@@ -383,8 +479,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Create default config file on startup if missing
-    let _ = ensure_config_exists();
+    // Create default config file on startup if missing (only for default path)
+    if config_path.file_name().map(|f| f == "pimonitor.yaml").unwrap_or(false) &&
+       config_path.parent().map(|p| p.as_os_str().is_empty() || p == Path::new(".")).unwrap_or(true) {
+        let _ = ensure_config_exists();
+    }
 
     // Setup terminal UI
     enable_raw_mode()?;
@@ -1573,7 +1672,11 @@ fn load_pi_creds_from(path: &Path) -> Option<(String, String)> {
 }
 
 fn load_pi_creds() -> Option<(String, String)> {
-    let path = PathBuf::from("pimonitor.yaml");
+    let path = if let Ok(cp) = CONFIG_PATH.lock() {
+        cp.clone()
+    } else {
+        PathBuf::from("pimonitor.yaml")
+    };
     load_pi_creds_from(&path)
 }
 
