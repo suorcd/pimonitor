@@ -912,7 +912,11 @@ async fn main() -> Result<()> {
                         Block::default()
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(Color::Yellow))
-                            .title(Span::styled("Select reason (Enter=confirm, Esc=cancel)", Style::default().fg(Color::Yellow))),
+                            .title(Span::styled(if app.vim_mode {
+                                "Select reason (Enter=confirm, Esc=cancel, j/k=nav)"
+                            } else {
+                                "Select reason (Enter=confirm, Esc=cancel)"
+                            }, Style::default().fg(Color::Yellow))),
                     )
                     .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
                     .highlight_symbol("▶ ");
@@ -1020,6 +1024,13 @@ async fn main() -> Result<()> {
                                 // Clamp to last index of reasons list
                                 let last = reason_options().len().saturating_sub(1);
                                 if app.reason_index < last { app.reason_index += 1; }
+                            }
+                            KeyCode::Char('j') if app.vim_mode => {
+                                let last = reason_options().len().saturating_sub(1);
+                                if app.reason_index < last { app.reason_index += 1; }
+                            }
+                            KeyCode::Char('k') if app.vim_mode => {
+                                if app.reason_index > 0 { app.reason_index -= 1; }
                             }
                             // Direct numeric selection (0-6) per AGENTS.md
                             KeyCode::Char('0') | KeyCode::Char('1') | KeyCode::Char('2') |
