@@ -577,16 +577,36 @@ async fn main() -> Result<()> {
             let playing_duration = app.playing_duration;
             let playback_start = app.playback_start;
             let volume = app.volume;
-            // Capture previously seen feed IDs
+            // Capture previously seen feed IDs and preserve flagged feeds with their positions
             let mut prev_ids: HashSet<u64> = HashSet::new();
-            for f in app.feeds.iter() {
-                if let Some(id) = f.id { prev_ids.insert(id); }
+            let mut flagged_feeds_with_index: Vec<(usize, Feed)> = Vec::new();
+            for (idx, f) in app.feeds.iter().enumerate() {
+                if let Some(id) = f.id {
+                    prev_ids.insert(id);
+                    // Preserve flagged feeds with their original index
+                    if app.flagged_reasons.contains_key(&id) {
+                        flagged_feeds_with_index.push((idx, f.clone()));
+                    }
+                }
             }
             // Apply incoming update
             app.feeds = new_state.feeds;
             app.last_updated = new_state.last_updated;
             app.source = new_state.source;
             app.status_msg = new_state.status_msg;
+            // Re-add any flagged feeds that disappeared from API response, trying to maintain position
+            let current_ids: HashSet<u64> = app
+                .feeds
+                .iter()
+                .filter_map(|f| f.id)
+                .collect();
+            for (original_idx, feed) in flagged_feeds_with_index {
+                if !current_ids.contains(&feed.id.unwrap_or(0)) {
+                    // Insert at original position (clamped to current list length)
+                    let insert_pos = original_idx.min(app.feeds.len());
+                    app.feeds.insert(insert_pos, feed);
+                }
+            }
             // Mark newly added feeds with a temporary star if beyond first minute
             let now = std::time::Instant::now();
             if now.duration_since(app.start_time) >= std::time::Duration::from_secs(60) {
@@ -769,35 +789,48 @@ async fn main() -> Result<()> {
                         .map(|exp| exp > now)
                         .unwrap_or(false);
 
-                    // First line: [id]. [title] ([language]) - [url]
-                    let mut parts = Vec::new();
-                    if is_new_mark { parts.push(Span::styled("*", Style::default().fg(Color::Green))); parts.push(Span::raw(" ")); }
+                    // First line: [id]. [FLAG reason] [title] ([language]) - [url]
                     let flagged_reason = feed
                         .id
                         .and_then(|id| app.flagged_reasons.get(&id).copied());
-                    if let Some(code) = flagged_reason {
-                        let label = reason_options()
-                            .into_iter()
-                            .find(|(_, c)| *c == code)
-                            .map(|(label, _)| label)
-                            .unwrap_or("Flagged");
-                        parts.push(Span::styled(
+                    let reason_label = flagged_reason
+                        .and_then(|code| {
+                            reason_options()
+                                .into_iter()
+                                .find(|(_, c)| *c == code)
+                                .map(|(label, _)| label)
+                        });
+
+                    let mut parts = Vec::new();
+                    if is_new_mark { parts.push(Span::styled("*", Style::default().fg(Color::Green))); parts.push(Span::raw(" ")); }
+                    
+                    parts.push(Span::styled(format!("{}.", id_str), Style::default().fg(Color::Yellow)));
+                    parts.push(Span::raw(" "));
+                    
+                    // Build crossed-out portion: flag label (if any) + title + language + url
+                    let mut crossed_parts = Vec::new();
+                    if let Some(label) = reason_label {
+                        crossed_parts.push(Span::styled(
                             format!("[FLAG {}] ", label),
                             Style::default().fg(Color::Red),
                         ));
                     }
-                    parts.extend_from_slice(&[
-                        Span::styled(format!("{}.", id_str), Style::default().fg(Color::Yellow)),
-                        Span::raw(" "),
+                    crossed_parts.extend_from_slice(&[
                         Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
                         Span::styled(format!(" ({})", lang_str), Style::default().fg(Color::LightMagenta)),
                         Span::raw(" - "),
                         Span::styled(url, Style::default().fg(Color::Cyan)),
                     ]);
-                    let mut line1 = Line::from(parts);
+
                     if flagged_reason.is_some() {
-                        line1 = line1.style(Style::default().add_modifier(Modifier::CROSSED_OUT));
+                        // Apply struck-out style to the crossed-out parts
+                        let crossed_line = Line::from(crossed_parts)
+                            .style(Style::default().add_modifier(Modifier::CROSSED_OUT));
+                        parts.extend(crossed_line.spans);
+                    } else {
+                        parts.extend(crossed_parts);
                     }
+                    let line1 = Line::from(parts);
 
                     // Second line: link
                     let mut line2 = Line::from(vec![
