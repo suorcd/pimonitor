@@ -334,6 +334,7 @@ struct AppState {
     playing_duration: Option<Duration>,
     volume: f32,
     playback_start: Option<std::time::Instant>,
+    paused_elapsed: Duration,
     // EQ UI state
     eq_levels: [f32; 12],
     eq_visible: bool,
@@ -372,6 +373,7 @@ impl AppState {
             playing_duration: None,
             volume: 1.0,
             playback_start: None,
+            paused_elapsed: Duration::from_secs(0),
             eq_levels: [0.0; 12],
             eq_visible: false,
             reason_modal: false,
@@ -406,6 +408,7 @@ impl AppState {
         self.playing_feed_title = None;
         self.playing_duration = None;
         self.playback_start = None;
+        self.paused_elapsed = Duration::from_secs(0);
         self.eq_visible = false;
         self.status_msg = "Playback stopped".into();
     }
@@ -635,6 +638,7 @@ async fn main() -> Result<()> {
                             app.audio_stream = Some(stream);
                             app.audio_sink = Some(sink);
                             app.playback_start = Some(std::time::Instant::now());
+                            app.paused_elapsed = Duration::from_secs(0);
                             // Calculate duration only if vim mode (optimization/strict adherence)
                             if app.vim_mode {
                                 app.playing_duration = get_duration_from_file(&path);
@@ -800,9 +804,14 @@ async fn main() -> Result<()> {
                     // Add currently playing podcast info if available
                     if let (Some(id), Some(title)) = (&app.playing_feed_id, &app.playing_feed_title) {
                         spans.push(Span::raw("  | "));
-                        let elapsed = app.playback_start
-                            .map(|start| start.elapsed().as_secs())
-                            .unwrap_or(0);
+                        // Calculate elapsed time: paused_elapsed + current session (if not paused)
+                        let current_elapsed = if let Some(start) = app.playback_start {
+                            start.elapsed()
+                        } else {
+                            Duration::from_secs(0)
+                        };
+                        let total_elapsed = app.paused_elapsed + current_elapsed;
+                        let elapsed = total_elapsed.as_secs();
                         let minutes = elapsed / 60;
                         let seconds = elapsed % 60;
                         
@@ -1134,9 +1143,16 @@ async fn main() -> Result<()> {
                                     // Same feed - toggle pause/resume
                                     if let Some(sink) = &app.audio_sink {
                                         if sink.is_paused() {
+                                            // Resume: reset playback_start to now so elapsed time calculation works
                                             sink.play();
+                                            app.playback_start = Some(std::time::Instant::now());
                                             app.status_msg = "Playback resumed".into();
                                         } else {
+                                            // Pause: accumulate elapsed time before pausing
+                                            if let Some(start) = app.playback_start {
+                                                app.paused_elapsed += start.elapsed();
+                                            }
+                                            app.playback_start = None;
                                             sink.pause();
                                             app.status_msg = "Playback paused".into();
                                         }
