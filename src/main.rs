@@ -33,6 +33,7 @@ use tokio::sync::mpsc;
 use tokio::time::interval;
 use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use sha1::{Sha1, Digest};
 use pimonitor::{reason_options, reason_code_for_index};
 use std::collections::{HashMap, HashSet};
@@ -42,6 +43,8 @@ use std::collections::{HashMap, HashSet};
 static POLL_INTERVAL: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(60));
 // Whether both API key and secret are present (read/write possible)
 static PI_READ_WRITE: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+// Path to the config file (default: pimonitor.yaml, can be overridden with --config)
+static CONFIG_PATH: Lazy<Mutex<PathBuf>> = Lazy::new(|| Mutex::new(PathBuf::from("pimonitor.yaml")));
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {
@@ -82,7 +85,13 @@ fn evaluate_config(cfg: &AppConfig) -> (u64, bool) {
 
 fn read_yaml_config() {
     // Read configuration from pimonitor.yaml before each polling cycle
-    let path = PathBuf::from("pimonitor.yaml");
+    // Use the path from CONFIG_PATH global, which can be overridden with --config
+    let path = if let Ok(cp) = CONFIG_PATH.lock() {
+        cp.clone()
+    } else {
+        PathBuf::from("pimonitor.yaml")
+    };
+    
     let mut interval_secs: u64 = 60; // default
     let mut can_rw = false; // default to false unless both present
 
@@ -197,6 +206,61 @@ mod tests {
         let after = fs::read_to_string(&p).unwrap();
         assert_eq!(before, after);
     }
+
+    #[test]
+    fn config_path_file_exists_and_readable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("pimonitor.yaml");
+        // Create a valid config file
+        let mut f = File::create(&p).expect("create file");
+        write!(f, "pi_api_key: \"test\"\npi_api_secret: \"test\"\n").unwrap();
+        drop(f);
+        
+        // Verify file exists
+        assert!(p.exists());
+        
+        // Verify file is readable
+        let contents = fs::read(&p);
+        assert!(contents.is_ok());
+        assert!(!contents.unwrap().is_empty());
+    }
+
+    #[test]
+    fn config_path_nonexistent_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("nonexistent.yaml");
+        
+        // Verify file does not exist
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn load_pi_creds_from_custom_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("custom_config.yaml");
+        let mut f = File::create(&p).expect("create file");
+        write!(f, "pi_api_key: \"my_key\"\npi_api_secret: \"my_secret\"\n").unwrap();
+        drop(f);
+        
+        let creds = load_pi_creds_from(&p);
+        assert!(creds.is_some());
+        let (key, secret) = creds.unwrap();
+        assert_eq!(key, "my_key");
+        assert_eq!(secret, "my_secret");
+    }
+
+    #[test]
+    fn load_pi_creds_missing_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("incomplete_config.yaml");
+        let mut f = File::create(&p).expect("create file");
+        write!(f, "pi_api_key: \"my_key\"\npi_api_secret: \"\"\n").unwrap();
+        drop(f);
+        
+        let creds = load_pi_creds_from(&p);
+        // Should return None because secret is empty
+        assert!(creds.is_none());
+    }
 }
 
 #[allow(dead_code)]
@@ -267,8 +331,10 @@ struct AppState {
     temp_audio_path: Option<PathBuf>,
     playing_feed_id: Option<u64>,
     playing_feed_title: Option<String>,
+    playing_duration: Option<Duration>,
     volume: f32,
     playback_start: Option<std::time::Instant>,
+    paused_elapsed: Duration,
     // EQ UI state
     eq_levels: [f32; 12],
     eq_visible: bool,
@@ -283,6 +349,8 @@ struct AppState {
     // App start time and ephemeral new markers
     start_time: std::time::Instant,
     new_feed_marks: HashMap<u64, std::time::Instant>,
+    // Locally tracked flagged feeds and their reason codes
+    flagged_reasons: HashMap<u64, u8>,
 }
 
 impl AppState {
@@ -304,8 +372,10 @@ impl AppState {
             temp_audio_path: None,
             playing_feed_id: None,
             playing_feed_title: None,
+            playing_duration: None,
             volume: 1.0,
             playback_start: None,
+            paused_elapsed: Duration::from_secs(0),
             eq_levels: [0.0; 12],
             eq_visible: false,
             reason_modal: false,
@@ -315,6 +385,7 @@ impl AppState {
             help_modal: false,
             start_time: std::time::Instant::now(),
             new_feed_marks: HashMap::new(),
+            flagged_reasons: HashMap::new(),
         }
     }
 
@@ -338,7 +409,9 @@ impl AppState {
         }
         self.playing_feed_id = None;
         self.playing_feed_title = None;
+        self.playing_duration = None;
         self.playback_start = None;
+        self.paused_elapsed = Duration::from_secs(0);
         self.eq_visible = false;
         self.status_msg = "Playback stopped".into();
     }
@@ -370,6 +443,38 @@ async fn main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
     let vim_mode = args.iter().any(|arg| arg == "--vim");
+    
+    // Parse --config flag for custom config file path
+    let config_path = if let Some(pos) = args.iter().position(|arg| arg == "--config") {
+        if pos + 1 < args.len() {
+            let path = PathBuf::from(&args[pos + 1]);
+            // Validate that the file exists and is readable
+            if !path.exists() {
+                eprintln!("Error: config file '{}' does not exist", path.display());
+                return Ok(());
+            }
+            // Try to read the file to ensure it's readable
+            match std::fs::read(&path) {
+                Ok(_) => {
+                    // Update the global CONFIG_PATH
+                    if let Ok(mut cp) = CONFIG_PATH.lock() {
+                        *cp = path.clone();
+                    }
+                    path
+                }
+                Err(e) => {
+                    eprintln!("Error: cannot read config file '{}': {}", path.display(), e);
+                    return Ok(());
+                }
+            }
+        } else {
+            eprintln!("Error: --config flag requires a path argument");
+            return Ok(());
+        }
+    } else {
+        // Use default path
+        PathBuf::from("pimonitor.yaml")
+    };
 
     // Ensure we're running in a real terminal (TTY). Many IDE "Run" consoles are not TTYs
     // and Ratatui won't be able to draw there, which looks like a blank window.
@@ -383,8 +488,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Create default config file on startup if missing
-    let _ = ensure_config_exists();
+    // Create default config file on startup if missing (only for default path)
+    if config_path.file_name().map(|f| f == "pimonitor.yaml").unwrap_or(false) &&
+       config_path.parent().map(|p| p.as_os_str().is_empty() || p == Path::new(".")).unwrap_or(true) {
+        let _ = ensure_config_exists();
+    }
 
     // Setup terminal UI
     enable_raw_mode()?;
@@ -456,24 +564,49 @@ async fn main() -> Result<()> {
             // Merge: replace data and status, keep scroll if possible
             let scroll = app.scroll;
             let selected = app.selected;
+            let prev_selected_id = app
+                .feeds
+                .get(selected)
+                .and_then(|f| f.id);
             // Preserve audio state across data updates
             let audio_stream = app.audio_stream.take();
             let audio_sink = app.audio_sink.take();
             let temp_audio_path = app.temp_audio_path.take();
             let playing_feed_id = app.playing_feed_id;
             let playing_feed_title = app.playing_feed_title.take();
+            let playing_duration = app.playing_duration;
             let playback_start = app.playback_start;
             let volume = app.volume;
-            // Capture previously seen feed IDs
+            // Capture previously seen feed IDs and preserve flagged feeds with their positions
             let mut prev_ids: HashSet<u64> = HashSet::new();
-            for f in app.feeds.iter() {
-                if let Some(id) = f.id { prev_ids.insert(id); }
+            let mut flagged_feeds_with_index: Vec<(usize, Feed)> = Vec::new();
+            for (idx, f) in app.feeds.iter().enumerate() {
+                if let Some(id) = f.id {
+                    prev_ids.insert(id);
+                    // Preserve flagged feeds with their original index
+                    if app.flagged_reasons.contains_key(&id) {
+                        flagged_feeds_with_index.push((idx, f.clone()));
+                    }
+                }
             }
             // Apply incoming update
             app.feeds = new_state.feeds;
             app.last_updated = new_state.last_updated;
             app.source = new_state.source;
             app.status_msg = new_state.status_msg;
+            // Re-add any flagged feeds that disappeared from API response, trying to maintain position
+            let current_ids: HashSet<u64> = app
+                .feeds
+                .iter()
+                .filter_map(|f| f.id)
+                .collect();
+            for (original_idx, feed) in flagged_feeds_with_index {
+                if !current_ids.contains(&feed.id.unwrap_or(0)) {
+                    // Insert at original position (clamped to current list length)
+                    let insert_pos = original_idx.min(app.feeds.len());
+                    app.feeds.insert(insert_pos, feed);
+                }
+            }
             // Mark newly added feeds with a temporary star if beyond first minute
             let now = std::time::Instant::now();
             if now.duration_since(app.start_time) >= std::time::Duration::from_secs(60) {
@@ -486,23 +619,44 @@ async fn main() -> Result<()> {
                 }
             }
             // Clamp preserved scroll so the last item remains visible when list shrinks.
-            let max_scroll = app
-                .feeds
-                .len()
-                .saturating_sub(viewport_items);
-            app.scroll = scroll.min(max_scroll);
-            // Clamp selected within bounds
-            if app.feeds.is_empty() {
-                app.selected = 0;
+            let len = app.feeds.len();
+            let new_selected = if let Some(id) = prev_selected_id {
+                app
+                    .feeds
+                    .iter()
+                    .position(|f| f.id == Some(id))
+                    .unwrap_or_else(|| selected.min(len.saturating_sub(1)))
+            } else if len == 0 {
+                0
             } else {
-                app.selected = selected.min(app.feeds.len() - 1);
+                selected.min(len - 1)
+            };
+
+            // Preserve scroll when possible but keep the selection visible if feeds shift.
+            let mut new_scroll = scroll;
+            let max_scroll = len.saturating_sub(viewport_items);
+            new_scroll = new_scroll.min(max_scroll);
+            if len > 0 {
+                if new_selected < new_scroll {
+                    new_scroll = new_selected;
+                }
+                let viewport_end = new_scroll + viewport_items.saturating_sub(1);
+                if new_selected > viewport_end {
+                    new_scroll = new_selected.saturating_sub(viewport_items.saturating_sub(1));
+                }
+                let max_scroll_again = len.saturating_sub(viewport_items);
+                new_scroll = new_scroll.min(max_scroll_again);
             }
+
+            app.scroll = new_scroll;
+            app.selected = new_selected;
             // Restore audio state and playback tracking
             app.audio_stream = audio_stream;
             app.audio_sink = audio_sink;
             app.temp_audio_path = temp_audio_path;
             app.playing_feed_id = playing_feed_id;
             app.playing_feed_title = playing_feed_title;
+            app.playing_duration = playing_duration;
             app.playback_start = playback_start;
             app.volume = volume;
         }
@@ -524,13 +678,21 @@ async fn main() -> Result<()> {
                     app.xml_show = false;
                     app.xml_scroll = 0;
                 }
+                UiMsg::FlagApplied(feed_id, reason_code) => {
+                    app.flagged_reasons.insert(feed_id, reason_code);
+                }
                 UiMsg::PlayReady(path) => {
                     match start_playback_from_file(&path) {
                         Ok((stream, sink)) => {
-                            app.temp_audio_path = Some(path);
+                            app.temp_audio_path = Some(path.clone());
                             app.audio_stream = Some(stream);
                             app.audio_sink = Some(sink);
                             app.playback_start = Some(std::time::Instant::now());
+                            app.paused_elapsed = Duration::from_secs(0);
+                            // Calculate duration only if vim mode (optimization/strict adherence)
+                            if app.vim_mode {
+                                app.playing_duration = get_duration_from_file(&path);
+                            }
                             // Start EQ analyzer in background
                             if let Some(p) = app.temp_audio_path.clone() {
                                 let ui_tx3 = ui_tx.clone();
@@ -566,6 +728,18 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+        }
+
+        // Check if playback has finished naturally (sink is empty)
+        // If so, stop playback to reset state and stop the timer
+        let audio_finished = if let Some(sink) = &app.audio_sink {
+            sink.empty()
+        } else {
+            false
+        };
+
+        if audio_finished && app.playing_feed_id.is_some() {
+            app.stop_playback();
         }
 
         // Also clamp scroll on window resizes (no new state), to keep last item visible.
@@ -615,23 +789,56 @@ async fn main() -> Result<()> {
                         .map(|exp| exp > now)
                         .unwrap_or(false);
 
-                    // First line: [id]. [title] ([language]) - [url]
+                    // First line: [id]. [FLAG reason] [title] ([language]) - [url]
+                    let flagged_reason = feed
+                        .id
+                        .and_then(|id| app.flagged_reasons.get(&id).copied());
+                    let reason_label = flagged_reason
+                        .and_then(|code| {
+                            reason_options()
+                                .into_iter()
+                                .find(|(_, c)| *c == code)
+                                .map(|(label, _)| label)
+                        });
+
                     let mut parts = Vec::new();
                     if is_new_mark { parts.push(Span::styled("*", Style::default().fg(Color::Green))); parts.push(Span::raw(" ")); }
-                    parts.extend_from_slice(&[
-                        Span::styled(format!("{}.", id_str), Style::default().fg(Color::Yellow)),
-                        Span::raw(" "),
+                    
+                    parts.push(Span::styled(format!("{}.", id_str), Style::default().fg(Color::Yellow)));
+                    parts.push(Span::raw(" "));
+                    
+                    // Build crossed-out portion: flag label (if any) + title + language + url
+                    let mut crossed_parts = Vec::new();
+                    if let Some(label) = reason_label {
+                        crossed_parts.push(Span::styled(
+                            format!("[FLAG {}] ", label),
+                            Style::default().fg(Color::Red),
+                        ));
+                    }
+                    crossed_parts.extend_from_slice(&[
                         Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
                         Span::styled(format!(" ({})", lang_str), Style::default().fg(Color::LightMagenta)),
                         Span::raw(" - "),
                         Span::styled(url, Style::default().fg(Color::Cyan)),
                     ]);
+
+                    if flagged_reason.is_some() {
+                        // Apply struck-out style to the crossed-out parts
+                        let crossed_line = Line::from(crossed_parts)
+                            .style(Style::default().add_modifier(Modifier::CROSSED_OUT));
+                        parts.extend(crossed_line.spans);
+                    } else {
+                        parts.extend(crossed_parts);
+                    }
                     let line1 = Line::from(parts);
 
                     // Second line: link
-                    let line2 = Line::from(vec![
+                    let mut line2 = Line::from(vec![
                         Span::styled(format!("    {}.", link), Style::default().fg(Color::LightMagenta)),
                     ]);
+                    if flagged_reason.is_some() {
+                        line2 = line2.style(Style::default().add_modifier(Modifier::CROSSED_OUT));
+                    }
 
                     ListItem::new(vec![line1, line2])
                 })
@@ -680,13 +887,32 @@ async fn main() -> Result<()> {
                     // Add currently playing podcast info if available
                     if let (Some(id), Some(title)) = (&app.playing_feed_id, &app.playing_feed_title) {
                         spans.push(Span::raw("  | "));
-                        let elapsed = app.playback_start
-                            .map(|start| start.elapsed().as_secs())
-                            .unwrap_or(0);
+                        // Calculate elapsed time: paused_elapsed + current session (if not paused)
+                        let current_elapsed = if let Some(start) = app.playback_start {
+                            start.elapsed()
+                        } else {
+                            Duration::from_secs(0)
+                        };
+                        let total_elapsed = app.paused_elapsed + current_elapsed;
+                        let elapsed = total_elapsed.as_secs();
                         let minutes = elapsed / 60;
                         let seconds = elapsed % 60;
+                        
+                        let duration_str = if app.vim_mode {
+                            if let Some(d) = app.playing_duration {
+                                let total_secs = d.as_secs();
+                                let t_min = total_secs / 60;
+                                let t_sec = total_secs % 60;
+                                format!(" / {}:{:02}", t_min, t_sec)
+                            } else {
+                                "".to_string()
+                            }
+                        } else {
+                            "".to_string()
+                        };
+
                         spans.push(Span::styled(
-                            format!("Playing: [{}] {} [{}:{:02}]", id, title, minutes, seconds),
+                            format!("Playing: [{}] {} [{}:{:02}{}]", id, title, minutes, seconds, duration_str),
                             Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                         ));
                     }
@@ -778,7 +1004,11 @@ async fn main() -> Result<()> {
                         Block::default()
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(Color::Yellow))
-                            .title(Span::styled("Select reason (Enter=confirm, Esc=cancel)", Style::default().fg(Color::Yellow))),
+                            .title(Span::styled(if app.vim_mode {
+                                "Select reason (Enter=confirm, Esc=cancel, j/k=nav)"
+                            } else {
+                                "Select reason (Enter=confirm, Esc=cancel)"
+                            }, Style::default().fg(Color::Yellow))),
                     )
                     .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
                     .highlight_symbol("▶ ");
@@ -887,6 +1117,13 @@ async fn main() -> Result<()> {
                                 let last = reason_options().len().saturating_sub(1);
                                 if app.reason_index < last { app.reason_index += 1; }
                             }
+                            KeyCode::Char('j') if app.vim_mode => {
+                                let last = reason_options().len().saturating_sub(1);
+                                if app.reason_index < last { app.reason_index += 1; }
+                            }
+                            KeyCode::Char('k') if app.vim_mode => {
+                                if app.reason_index > 0 { app.reason_index -= 1; }
+                            }
                             // Direct numeric selection (0-6) per AGENTS.md
                             KeyCode::Char('0') | KeyCode::Char('1') | KeyCode::Char('2') |
                             KeyCode::Char('3') | KeyCode::Char('4') | KeyCode::Char('5') |
@@ -913,6 +1150,7 @@ async fn main() -> Result<()> {
                                         match pi_report_problematic(feed_id, reason_code).await {
                                             Ok(desc) => {
                                                 let _ = ui_tx2.send(UiMsg::Status(format!("Problematic reported: {}", desc)));
+                                                let _ = ui_tx2.send(UiMsg::FlagApplied(feed_id, reason_code));
                                                 let _ = poll_for_new_feeds(tx2).await;
                                             }
                                             Err(e) => {
@@ -937,6 +1175,7 @@ async fn main() -> Result<()> {
                                         match pi_report_problematic(feed_id, reason_code).await {
                                             Ok(desc) => {
                                                 let _ = ui_tx2.send(UiMsg::Status(format!("Problematic reported: {}", desc)));
+                                                let _ = ui_tx2.send(UiMsg::FlagApplied(feed_id, reason_code));
                                                 let _ = poll_for_new_feeds(tx2).await;
                                             }
                                             Err(e) => {
@@ -989,9 +1228,16 @@ async fn main() -> Result<()> {
                                     // Same feed - toggle pause/resume
                                     if let Some(sink) = &app.audio_sink {
                                         if sink.is_paused() {
+                                            // Resume: reset playback_start to now so elapsed time calculation works
                                             sink.play();
+                                            app.playback_start = Some(std::time::Instant::now());
                                             app.status_msg = "Playback resumed".into();
                                         } else {
+                                            // Pause: accumulate elapsed time before pausing
+                                            if let Some(start) = app.playback_start {
+                                                app.paused_elapsed += start.elapsed();
+                                            }
+                                            app.playback_start = None;
                                             sink.pause();
                                             app.status_msg = "Playback paused".into();
                                         }
@@ -1573,7 +1819,11 @@ fn load_pi_creds_from(path: &Path) -> Option<(String, String)> {
 }
 
 fn load_pi_creds() -> Option<(String, String)> {
-    let path = PathBuf::from("pimonitor.yaml");
+    let path = if let Ok(cp) = CONFIG_PATH.lock() {
+        cp.clone()
+    } else {
+        PathBuf::from("pimonitor.yaml")
+    };
     load_pi_creds_from(&path)
 }
 
@@ -1629,6 +1879,7 @@ enum UiMsg {
     EqEnd,
     XmlReady(String),
     XmlError(String),
+    FlagApplied(u64, u8),
 }
 
 async fn fetch_feed_xml(feed_url: String, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()> {
@@ -1878,6 +2129,31 @@ fn start_playback_from_file(path: &PathBuf) -> Result<(OutputStream, Sink)> {
     sink.append(decoder);
     sink.play();
     Ok((stream, sink))
+}
+
+fn get_duration_from_file(path: &Path) -> Option<Duration> {
+    let file = File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let hint = Hint::new();
+    let probed = get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .ok()?;
+    let format = probed.format;
+    
+    // Select the first audio track
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.sample_rate.is_some())?;
+        
+    let params = &track.codec_params;
+    
+    if let (Some(n_frames), Some(tb)) = (params.n_frames, params.time_base) {
+        let time = tb.calc_time(n_frames);
+        return Some(Duration::from_secs(time.seconds) + Duration::from_secs_f64(time.frac));
+    }
+    
+    None
 }
 
 // Spawn an analyzer that computes 5-band EQ magnitudes from the audio file and sends periodic updates.

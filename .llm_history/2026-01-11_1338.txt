@@ -1,0 +1,7 @@
+Changes:
+- Fixed flagged feeds disappearing on refresh: flagged feeds are now preserved in the feed list even when the API no longer returns them.
+- Captures copies of flagged feeds before applying new API data, then re-adds them if they're missing from the fresh response.
+- Strike-through and flag label now persist across refreshes.
+
+Tests:
+- cargo test
