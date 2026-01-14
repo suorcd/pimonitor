@@ -508,6 +508,10 @@ async fn main() -> Result<()> {
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel::<UiMsg>();
     let mut app = AppState::new(vim_mode);
 
+    // Note: We rely on in-app quit (e.g., 'q') to perform graceful cleanup.
+    // For forced termination (e.g., SIGINT), OS may not run destructors; best-effort cleanup
+    // is handled via stop_playback() when we exit the UI loop.
+
     // Spawn background task to periodically fetch
     let tx_clone = tx.clone();
     tokio::spawn(async move {
@@ -1725,13 +1729,16 @@ async fn main() -> Result<()> {
         ui_tick.tick().await;
     }
 
+    // Ensure playback is stopped and any temp audio file is removed before exiting
+    app.stop_playback();
+
     // Restore terminal
     disable_raw_mode()?;
     let mut stdout = std::io::stdout();
     stdout.execute(LeaveAlternateScreen)?;
-    
-    // Exit the process to terminate the background polling task
-    std::process::exit(0);
+
+    // Return normally; the Tokio runtime will shut down background tasks.
+    Ok(())
 }
 
 // The main polling function which fetches new feeds from the Podcast Index API.
@@ -2085,7 +2092,53 @@ fn extract_latest_enclosure_url(xml: &str) -> Option<String> {
 async fn download_to_temp(url: &str) -> Result<PathBuf> {
     let client = reqwest::Client::new();
     let mut resp = client.get(url).send().await?.error_for_status()?;
-    let mut tmp = tempfile::NamedTempFile::new()?;
+
+    // Try to preserve a helpful file extension to improve format probing (e.g., .m4a)
+    // 1) Prefer Content-Type header mapping
+    // 2) Fall back to URL path extension
+    let mut suffix: Option<&'static str> = None;
+
+    if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
+        if let Ok(ct_str) = ct.to_str() {
+            let ct_lc = ct_str.to_ascii_lowercase();
+            suffix = match ct_lc.split(';').next().unwrap_or("") {
+                "audio/mp4" | "audio/x-m4a" | "audio/aacp" => Some(".m4a"),
+                "audio/aac" => Some(".aac"),
+                "audio/mpeg" => Some(".mp3"),
+                "audio/ogg" => Some(".ogg"),
+                "audio/opus" => Some(".opus"),
+                "audio/wav" | "audio/x-wav" => Some(".wav"),
+                "audio/flac" => Some(".flac"),
+                _ => None,
+            };
+        }
+    }
+
+    if suffix.is_none() {
+        // Parse extension from URL path (best-effort, no extra deps)
+        let url_no_query = url.split('?').next().unwrap_or(url);
+        if let Some(last_seg) = url_no_query.rsplit('/').next() {
+            if let Some(idx) = last_seg.rfind('.') {
+                let ext = &last_seg[idx..]; // includes dot
+                // Whitelist common audio extensions
+                match ext.to_ascii_lowercase().as_str() {
+                    ".m4a" | ".mp4" => suffix = Some(".m4a"),
+                    ".mp3" => suffix = Some(".mp3"),
+                    ".aac" => suffix = Some(".aac"),
+                    ".ogg" => suffix = Some(".ogg"),
+                    ".opus" => suffix = Some(".opus"),
+                    ".wav" => suffix = Some(".wav"),
+                    ".flac" => suffix = Some(".flac"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut builder = tempfile::Builder::new();
+    if let Some(suf) = suffix { builder.suffix(suf); }
+    let mut tmp = builder.tempfile()?;
+
     while let Some(chunk) = resp.chunk().await? {
         use std::io::Write;
         tmp.write_all(&chunk)?;
@@ -2134,7 +2187,10 @@ fn start_playback_from_file(path: &PathBuf) -> Result<(OutputStream, Sink)> {
 fn get_duration_from_file(path: &Path) -> Option<Duration> {
     let file = File::open(path).ok()?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let hint = Hint::new();
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
     let probed = get_probe()
         .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
         .ok()?;
@@ -2174,7 +2230,10 @@ fn analyze_file_eq(path: PathBuf, tx: mpsc::UnboundedSender<UiMsg>) -> Result<()
     // Open media source
     let file = std::fs::File::open(&path)?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
-    let hint = Hint::new();
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
     let probed = get_probe()
         .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
     .map_err(|e| anyhow::anyhow!("probe error: {}", e))?;
