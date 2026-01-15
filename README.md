@@ -6,6 +6,7 @@ allows rudimentary analysis of them.  This is a work in progress.
 ## Key bindings
 - `q` to quit
 - `r` to refresh the feed list
+- `s` to search the feed list by text or feed id
 - `p` to play the latest enclosure for the selected feed
 - `x` to view the RSS xml for the selected feed
 - `d` to mark a feed as problematic
