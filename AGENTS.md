@@ -7,6 +7,13 @@
 - Each feed object in the api response `feeds` array/vector contains a `dead` property.  If this property is `true` or `1`, hide the feed from the user interface.
 - When the feed list is refreshed, ensure the cursor stays on the currently selected feed.
 
+## Searching for a feed
+- Pressing the `s` key will open a small dialog box where the user can enter a search term and press Enter to search. 
+- Searching will jump the cursor to the first feed that matches the search term.  If no feeds match the search term, print an error message to the console.
+- If the search term is empty, pressing Enter should do nothing.
+- The search term should be broken apart into individual words.  All words should be present in the feed title for it to be considered a match.
+- If the search term consists entirely of an integer greater than 0, treat it as a feed ID and jump the cursor to the feed with that ID.  If no such feed exists, print an error message to the console.
+
 ## Marking a feed as "problematic"
 - Pressing the `d` key will mark a feed as problematic by sending a POST request to 
   the Podcast Index API endpoint: 'https://api.podcastindex.org/api/1.0/report/problematic'.  

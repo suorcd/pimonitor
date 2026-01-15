@@ -35,7 +35,7 @@ use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use sha1::{Sha1, Digest};
-use pimonitor::{reason_options, reason_code_for_index};
+use pimonitor::{reason_options, reason_code_for_index, find_feed_index_by_query};
 use std::collections::{HashMap, HashSet};
 
 // Global configuration flags populated from pimonitor.yaml
@@ -351,6 +351,9 @@ struct AppState {
     new_feed_marks: HashMap<u64, std::time::Instant>,
     // Locally tracked flagged feeds and their reason codes
     flagged_reasons: HashMap<u64, u8>,
+    // Search modal state
+    search_modal: bool,
+    search_input: String,
 }
 
 impl AppState {
@@ -386,6 +389,8 @@ impl AppState {
             start_time: std::time::Instant::now(),
             new_feed_marks: HashMap::new(),
             flagged_reasons: HashMap::new(),
+            search_modal: false,
+            search_input: String::new(),
         }
     }
 
@@ -1020,6 +1025,33 @@ async fn main() -> Result<()> {
                 f.render_stateful_widget(list, area, &mut list_state);
             }
 
+            // Search modal
+            if app.search_modal {
+                let area = centered_rect(60, 30, size);
+                let mut lines: Vec<Line> = Vec::new();
+                lines.push(Line::from(Span::raw("Enter search term:")));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!("{}", app.search_input),
+                    Style::default().fg(Color::Cyan),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Enter: search   Esc: cancel   Tip: words -> all must appear; number -> feed id",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                let popup = Paragraph::new(lines)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow))
+                            .title(Span::styled("Search", Style::default().fg(Color::Yellow))),
+                    )
+                    .wrap(Wrap { trim: true });
+                f.render_widget(Clear, area);
+                f.render_widget(popup, area);
+            }
+
             // Help modal (vim mode)
             if app.help_modal {
                 let area = centered_rect(70, 70, size);
@@ -1039,6 +1071,7 @@ async fn main() -> Result<()> {
                     Line::from("  =           - Volume up"),
                     Line::from("  Enter       - View feed details"),
                     Line::from("  x           - View feed XML"),
+                    Line::from("  s           - Search feeds"),
                     Line::from("  r           - Refresh feed list"),
                     Line::from("  d           - Report feed as problematic"),
                     Line::from(""),
@@ -1105,6 +1138,57 @@ async fn main() -> Result<()> {
         if event::poll(Duration::from_millis(10))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press {
+                    // Search modal input handling
+                    if app.search_modal {
+                        match k.code {
+                            KeyCode::Esc => {
+                                app.search_modal = false;
+                                app.search_input.clear();
+                            }
+                            KeyCode::Backspace => {
+                                app.search_input.pop();
+                            }
+                            KeyCode::Enter => {
+                                let q = app.search_input.trim().to_string();
+                                if q.is_empty() {
+                                    // Do nothing per spec
+                                } else {
+                                    // Build tuples aligned with feeds vector
+                                    let tuples: Vec<(u64, String)> = app
+                                        .feeds
+                                        .iter()
+                                        .map(|f| (f.id.unwrap_or(0), f.title.clone().unwrap_or_default()))
+                                        .collect();
+                                    if let Some(found) = find_feed_index_by_query(&tuples, &q) {
+                                        app.selected = found.min(app.feeds.len().saturating_sub(1));
+                                        // Ensure selected is visible
+                                        let bottom = app.scroll + viewport_items;
+                                        if app.selected >= bottom {
+                                            app.scroll = app.selected + 1 - viewport_items;
+                                        } else if app.selected < app.scroll {
+                                            app.scroll = app.selected;
+                                        }
+                                        app.status_msg = format!("Jumped to match: {}", q);
+                                        app.search_modal = false;
+                                        app.search_input.clear();
+                                    } else {
+                                        eprintln!("No feeds match the search: '{}'", q);
+                                        app.status_msg = "No feeds matched".into();
+                                        // Keep modal open for user to edit
+                                    }
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                // Allow standard printable characters
+                                if !c.is_control() {
+                                    app.search_input.push(c);
+                                }
+                            }
+                            KeyCode::Tab => { /* ignore */ }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     // If reason selection modal is open, handle its navigation first
                     if app.reason_modal {
                         match k.code {
@@ -1198,6 +1282,12 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     match k.code {
+                        // Open search modal
+                        KeyCode::Char('s') => {
+                            app.search_modal = true;
+                            app.search_input.clear();
+                            app.status_msg = "Search…".into();
+                        }
                         KeyCode::Char('q') => break,
                         // Vim mode ? for help
                         KeyCode::Char('?') if app.vim_mode => {

@@ -65,3 +65,39 @@ pub fn reason_code_for_index(idx: usize) -> u8 {
     let i = idx.min(opts.len().saturating_sub(1));
     opts[i].1
 }
+
+// =========================
+// Feed search helpers
+// =========================
+// Find the index of the first feed matching the query.
+// - If `query` is a positive integer, it is treated as a feed id and the first
+//   entry whose id equals that value is returned.
+// - Otherwise, the query is split into whitespace-separated words; all words
+//   must be found (case-insensitive) as substrings within the title for a match.
+// - Empty or whitespace-only query returns None (caller may choose to "do nothing").
+// The function operates over a simplified slice of (id, title) so it can be used
+// from both the binary and tests without depending on the internal Feed struct.
+pub fn find_feed_index_by_query<T: AsRef<str>>(feeds: &[(u64, T)], query: &str) -> Option<usize> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
+    }
+    // Numeric id search (must be > 0)
+    if let Ok(id_val) = q.parse::<u64>() {
+        if id_val > 0 {
+            return feeds.iter().position(|(id, _)| *id == id_val);
+        }
+    }
+    // Word-conjunction search on title
+    let words: Vec<String> = q
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    feeds.iter().position(|(_, title)| {
+        let t = title.as_ref().to_lowercase();
+        words.iter().all(|w| t.contains(w))
+    })
+}
